@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791580177553,
+  "lastUpdate": 1791754073738,
   "repoUrl": "https://github.com/andymai/brepkit",
   "entries": {
     "Boolean perf": [
@@ -53999,6 +53999,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 48098150,
             "range": "± 107287",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hi@andymai.com",
+            "name": "Andy Aragon",
+            "username": "andymai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2be0a1a5d8cc7d684770b6c7639c53833efd0988",
+          "message": "perf(math): solve banded fitting systems without dense elimination (#2030)\n\nThe interpolation bottleneck is removed. The scheduled Mutation Testing\nworkflow failed on main on 2026-10-04 and 2026-10-11 because\ncargo-mutants' unmutated baseline exceeded its 120 second timeout in\n`analytic_intersection::tests::marcher_keeps_to_its_region`.\n\nIn debug, the test took 155 seconds, and every stack sample landed in\n`nurbs::fitting::gauss_solve`, called by `interpolate` for the curve\ntraced by the general analytic marcher. `solve_interpolation` built the\ndense basis matrix and ran O(n³) elimination once per coordinate,\nalthough each row has at most p+1 nonzeros. `gauss_solve` now tracks row\nbounds, skips zero pivot-column rows, and limits updates to the pivot\nrow's last nonzero, giving O(n·w²) arithmetic for bandwidth w. Partial\npivoting is unchanged. One pass now solves x, y, and z, with the same\nthree-column solve used by `solve_approximation`.\n\nNo pose sweep was run because solver output is bitwise identical, so\nevery downstream result is unchanged. The release commit's red Cargo\nDeny job was an unrelated Docker Hub pull rate limit, fixed by\nrerunning.\n\n## Tests\n\n- Marcher test: 0.35 seconds in debug. Mutation scope: 836 tests in 17.8\nseconds under nextest with two threads.\n- Temporary probe (not committed): every control point matched the old\nsolver bit for bit, for 7, 60, 250, and 180 points at degrees 2, 3, 3,\nand 5.\n- Added `interpolate_long_helix_hits_every_point`: 1500 degree-3 helix\npoints, each within 1e-9.\n\n<!-- This is an auto-generated description by cubic. -->\n---\n## Summary by cubic\nSpeeds up NURBS curve interpolation by solving banded fitting matrices\nin O(n·w²) time, eliminating the dense elimination that made\nthousand-point marched curves take minutes in debug and caused a\nmutation-testing baseline timeout.\n\n- The old solver ran dense Gaussian elimination once per coordinate on\nthe full basis matrix; now it tracks row bounds, skips rows already zero\nin the pivot column, limits updates to the pivot row's last nonzero, and\nsolves x, y, and z in a single pass.\n- Solver output is bitwise identical to the old path, so all downstream\nresults are unchanged.\n- The marcher test dropped from 155 to 0.35 seconds in debug.\n\n**Tests**\n\n- Added `interpolate_long_helix_hits_every_point`, fitting 1500 degree-3\nhelix points and checking each one within 1e-9.\n- Verified against the old solver bit-for-bit for 7, 60, 250, and 180\npoints at degrees 2, 3, 3, and 5.\n\n<sup>Written for commit ed566cc6aedb9a3e1f26059bfc4a578ae4b44005.\nSummary will update on new commits.</sup>\n\n<a\nhref=\"https://cubic.dev/pr/andymai/brepkit/pull/2030?utm_source=github\"\ntarget=\"_blank\" rel=\"noopener noreferrer\"\ndata-no-image-dialog=\"true\"><picture><source\nmedia=\"(prefers-color-scheme: dark)\"\nsrcset=\"https://www.cubic.dev/buttons/review-in-cubic-dark.svg\"><source\nmedia=\"(prefers-color-scheme: light)\"\nsrcset=\"https://www.cubic.dev/buttons/review-in-cubic-light.svg\"><img\nalt=\"View guided diff\"\nsrc=\"https://www.cubic.dev/buttons/review-in-cubic-light.svg\"></picture></a>\n<a\nhref=\"https://www.cubic.dev/action/auto-fix/pr/andymai/brepkit/2030?returnTo=https%3A%2F%2Fgithub.com%2Fandymai%2Fbrepkit%2Fpull%2F2030&source=description\"\ntarget=\"_blank\" rel=\"noopener noreferrer\"\ndata-no-image-dialog=\"true\"><picture><source\nmedia=\"(prefers-color-scheme: dark)\"\nsrcset=\"https://www.cubic.dev/buttons/turn-on-auto-fix-dark.svg\"><source\nmedia=\"(prefers-color-scheme: light)\"\nsrcset=\"https://www.cubic.dev/buttons/turn-on-auto-fix-light.svg\"><img\nalt=\"Turn on auto-fix\"\nsrc=\"https://www.cubic.dev/buttons/turn-on-auto-fix-light.svg\"></picture></a>\n\n<!-- End of auto-generated description by cubic. -->",
+          "timestamp": "2026-10-11T21:24:49Z",
+          "tree_id": "768452871132370b7dd1c89b6e49c5d967be9bdc",
+          "url": "https://github.com/andymai/brepkit/commit/2be0a1a5d8cc7d684770b6c7639c53833efd0988"
+        },
+        "date": 1791754068448,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1073077,
+            "range": "± 3663",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1159693,
+            "range": "± 20211",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 12987,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 771688,
+            "range": "± 1597",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 48427045,
+            "range": "± 151144",
             "unit": "ns/iter"
           }
         ]
