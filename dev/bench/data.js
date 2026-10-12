@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791756091782,
+  "lastUpdate": 1791771764722,
   "repoUrl": "https://github.com/andymai/brepkit",
   "entries": {
     "Boolean perf": [
@@ -54107,6 +54107,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 47990223,
             "range": "± 172776",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hi@andymai.com",
+            "name": "Andy Aragon",
+            "username": "andymai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4165751158f20b52bb678aed1e6e23ae63874110",
+          "message": "ci(mutants): test only the past week's math changes, in eight shards (#2032)\n\nThe weekly Mutation Testing workflow now tests only the last 7 days of\n`crates/math` changes. It passes that diff to `cargo mutants --in-diff\n--package brepkit-math` across an 8-shard matrix using `--shard k/8`,\nwith `fail-fast: false`, and uploads a `mutants-report-<k>` artifact per\nshard. The previous scope covered all of `brepkit-math` and\n`brepkit-algo`, producing 37,681 mutants on 2026-10-11. Mutants took\nabout 13 seconds each on 2026-09-27, and the job reached its 60 minute\ntimeout. Every scheduled run from 2026-08-23 through 2026-09-27 was\ncancelled.\n\nThe 7 day cutoff is calculated from HEAD's commit time rather than the\nrunner clock. Every shard therefore derives the same diff and mutant\nlist.\n\n`brepkit-algo` is excluded because cargo-mutants runs only the mutated\ncrate's tests, while algo is tested mostly from `brepkit-operations`.\nAlgo mutants consequently report as missed. All 196 missed mutants in\nthe 2026-09-27 run were in `crates/algo`.\n\nMissed mutants (exit 2) and timed-out mutants (exit 3) appear in each\nshard's job summary without failing the job. Other non-zero exits,\nincluding a failed unmutated baseline (exit 4), still fail. Findings are\nreport-only because a week of math changes yields missed mutants, some\nequivalent, and failing on them would turn the workflow red every week.\nFor example, changing `(k + 1)..end` to `k..end` in `gauss_solve`\nrewrites `a[i][k]`, but the next line sets it to `0.0`. This matches the\nrepository's advisory SemVer Check and report-only OSV scan.\n\n## Tests\n\n- Run 38191733658 tested 484 mutants before findings became report-only.\nEvery shard finished in 6 to 12 minutes, with 135 missed, 217 caught,\nand 132 unviable.\n- Local simulation against a downloaded shard report confirmed that\nexits 0, 2, and 3 pass, while exit 4 fails.\n- Current-head run:\nhttps://github.com/andymai/brepkit/actions/runs/38192771939",
+          "timestamp": "2026-10-12T02:20:15Z",
+          "tree_id": "df1f1f8416084052e2191715487c3e9b83486e83",
+          "url": "https://github.com/andymai/brepkit/commit/4165751158f20b52bb678aed1e6e23ae63874110"
+        },
+        "date": 1791771757904,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 606590,
+            "range": "± 19206",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 643702,
+            "range": "± 16030",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 7966,
+            "range": "± 655",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 424395,
+            "range": "± 10018",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 30596701,
+            "range": "± 754729",
             "unit": "ns/iter"
           }
         ]
