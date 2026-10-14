@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791937258881,
+  "lastUpdate": 1792018956687,
   "repoUrl": "https://github.com/andymai/brepkit",
   "entries": {
     "Boolean perf": [
@@ -54215,6 +54215,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 39861806,
             "range": "± 624784",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hi@andymai.com",
+            "name": "Andy Aragon",
+            "username": "andymai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3405058e1e159f1cb0718d5966d22e06d49ea5a3",
+          "message": "feat(io): read STEP units, assembly placements, surface models and seamless faces (#2035)\n\nThe STEP reader now normalizes missing seams, applies units and assembly\nplacements, returns surface models, and reads surfaces of revolution.\nThese changes address reader gaps reported in #2033 by step-conformance,\nwhere brepkit 4.1.49 passed 20 of 28 shop-part runs and 30 of 76\nknown-shape runs.\n\n### What the reader does now\n\n- **Seams:** `close_seams` adds generator lines to cylindrical and\nconical faces bounded only by rims, including pointed cones bounded by\none rim and an optional apex `VERTEX_LOOP`. When the rims share no\nvertex on one generator, a lone closed circle or ellipse rim has its\nvertex slid to the generator; otherwise the rim edge crossing it is\nsplit in every loop that uses it, with knot insertion for a closed\nB-spline rim. Existing seams are preserved, and failures leave the face\nunchanged with a warning. Closed circles are anchored at their edge\nvertex because the reader drops the `CIRCLE` reference direction. Seams\nare added in the reader because they are an invariant brepkit's own\nprimitives follow and its meshers, booleans, and `unify_faces` rely on.\nNormalizing at import keeps every downstream operation correct, not only\nmeshing. Edge uses are indexed once per shell.\n\n- **Units and placements:** Every representation is converted from its\nSI or conversion-based length unit to millimetres.\n`ITEM_DEFINED_TRANSFORMATION`, `MAPPED_ITEM`, and plain\nshape-representation relationships are applied, with\n`NEXT_ASSEMBLY_USAGE_OCCURRENCE` deciding relationship direction when\nthe orders disagree. Shapes are built once in their own unit, then\ncopied and transformed once per placement chain to a root. Repeated\nparts produce repeated solids, and nested assemblies compose. Each shell\nowns its vertices and edges, so shells sharing a file edge remain\nseparate solids and are moved once each. An `AXIS2_PLACEMENT_3D` without\na reference direction uses the ISO 10303-42 default. A `MAPPED_ITEM` may\ntarget a `CARTESIAN_TRANSFORMATION_OPERATOR_3D` (plain or complex\nrecord) as well as an axis placement, with the operator's scale applied.\n\n- **Surface models:** Each shell in a `SHELL_BASED_SURFACE_MODEL` and\neach face set in a `FACE_BASED_SURFACE_MODEL` is returned as one\n`SolidId`, including open shells. This follows the existing `read_step`\nreturn type and brepkit's representation of loose or open shells. An\n`ORIENTED_OPEN_SHELL` or `ORIENTED_CLOSED_SHELL` flagged false turns its\nfaces over. A surface model that cannot be built is skipped with a\nwarning while other shapes continue to load.\n\n- **Revolutions:** `SURFACE_OF_REVOLUTION` now produces exact cylinders,\ncones, planes, spheres, or tori when the profile permits. Other profiles\nproduce rational B-spline surfaces by carrying every profile control\npoint around a nine-point rational circle; an `ELLIPSE` profile is first\nwritten as its own nine-point rational B-spline. The turn is `u` and the\nprofile is `v`, matching STEP's parameterization and normal direction.\nFor profiles crossing the axis, the face side is determined from a\nboundary point for lines or from a boundary seam following the profile\ncurve. Otherwise a warning is logged. The reader still ignores pcurves.\nThis case uses face geometry and a seam on the profile curve instead.\n\n### Verification\n\nTests in `step_missing_seams.rs`, `step_units_and_placements.rs`,\n`step_surface_models.rs`, `step_surface_of_revolution.rs`, and\n`revolution.rs` construct STEP records directly and check validity,\nvolume, closed meshes, coverage, vertex placement, and face orientation.\nThe existing `brepkit-io` suite passes.\n\nA local probe made the suite's `read_step` and\n`tessellate_solid_grouped_with_tolerance` calls and measured both\ndistances against each part's `truth.json`. At 0.0125, 0.05, 0.1, and\n0.5 mm, `cylinder`, `far_cylinder`, `washer`, `tiny_pin`, `sheet_disc`,\n`cone_point`, `cone_point_vertex`, `cylinder_inch`, `cylinder_placed`,\nand `cylinder_twice` pass. Existing passes for `cylinder_seam`,\n`cylinder_nurbs`, `dome`, and `torus_ring` remain.\n\n`bowl_01` reads as one open shell with five faces, including two exact\ntori. Every face is within tolerance of its surface, with the floor\nfacing down, rolled rim out, lip up, and inner fillet into the bowl. The\nseven shop parts introduce no newly empty faces, and face areas agree\nexcept for the two `sled_base` B-spline fillets that also fail on main.\nReading and meshing `plate_900_holes` at 0.5 mm takes about 1.0 s, as on\nmain (three runs each).\n\n### Behavior change\n\n`read_step` now returns millimetres. An inch-authored file is therefore\n25.4 times larger than before, and each assembly placement is returned\nas its own solid. All seven corpus shop parts are inch files, and the\nconformance adapter currently passes tolerances in the file's own unit,\nso it would pass millimetres instead.\n\nAssemblies are refused with a parse error above 100,000 placed shapes or\n20,000,000 units of placed size, counting faces, edge uses, and B-spline\ncontrol points. Placement enumeration spends from the shared allowance,\nand all copies are charged before copying starts. Tests reject both 25\ndoubling levels and 120,000 repeated copies in well under one second.\n\n### Not in this PR\n\nThe mesher side of #2033 is #2036: the `sled_base` B-spline fillets and\nthe small caps that came back empty beside them, the `dome_nurbs` pole,\n`torus_ring_nurbs` undersampling, a seamed sphere cap meshing the other\nhemisphere, and B-spline bands closed along v. `freeform_panel` is in\nneither: its root is NURBS point projection in brepkit-math.\n\n`CLAUDE.md` and the io-formats skill document the new reader behavior.\n\nPart of #2033.",
+          "timestamp": "2026-10-14T15:59:10-07:00",
+          "tree_id": "aa997fec1dd91137cf9c8957066696d7f7e6ab7f",
+          "url": "https://github.com/andymai/brepkit/commit/3405058e1e159f1cb0718d5966d22e06d49ea5a3"
+        },
+        "date": 1792018949868,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1035047,
+            "range": "± 1996",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1123050,
+            "range": "± 5563",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13212,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 734098,
+            "range": "± 1213",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 46503554,
+            "range": "± 116133",
             "unit": "ns/iter"
           }
         ]
