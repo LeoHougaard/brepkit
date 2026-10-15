@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792020816515,
+  "lastUpdate": 1792056409397,
   "repoUrl": "https://github.com/andymai/brepkit",
   "entries": {
     "Boolean perf": [
@@ -54323,6 +54323,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 48179322,
             "range": "± 179061",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hi@andymai.com",
+            "name": "Andy Aragon",
+            "username": "andymai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "41c7e5f10b9a6269a587a1cecdeffba07e3470dd",
+          "message": "fix(operations): mesh v-closed NURBS faces, pole meridians and seamed sphere caps (#2036)\n\nThis fixes the #2033 meshing failures for the two rational degree-2\nB-spline fillets and planar caps in `sled_base.step`, the roughly 3.9 mm\nerror in `dome_nurbs`, and the `torus_ring_nurbs` failures at 0.0125,\n0.05, and 0.1 mm. `dome_nurbs` and `torus_ring_nurbs` now pass the\nsuite's criterion (mesh and true surface within four times the tolerance\nof each other both ways) at all four tolerances, and the `sled_base`\nfillets and caps mesh their full area.\n\n### Fixes\n\n- **Fillets and caps:** The CDT mesher treated closed directions as u in\nits seam, pole, and winding-loop rules. For sled_base faces 356 and 358,\nwhich are closed in v with the quarter-torus profile in u, the seam fix\npinned the profile arc to one u and folded the fillet over itself. A\nv-closed NURBS face is now meshed after exchanging parameters and\nreversing the old u: `T(p, q) = S(mirror - q, p)`. This preserves every\npoint and the orientation relation `dT/dp x dT/dq = dS/du x dS/dv`.\nPcurves are mapped into the exchanged frame. `seam_vertex_u` also places\nseam copies for u-closed NURBS faces, skips poles, and uses the surface\nperiod. Closing the fillets removes the boundary cracks that caused\n`weld_boundary_vertices`, at twice the deflection, to collapse the two\n0.05 inch cap rims.\n\n- **Dome pole:** `close_loop_at_pole` adds a virtual meridian from the\nrim to the pole. The NURBS path was previously represented by one chord,\nleaving fins in the plane `y = 0`. The meridian is now sampled with\n`surface_path_divisions`, keeping chords within the deflection and turns\nwithin the angular tolerance.\n\n- **Torus seam:** `join_winding_hole` previously derived its virtual\njoining-seam spacing from the rims' mean spacing over the straight\nreach, producing about three samples across the 5 mm tube half circle.\nIts step count is now at least the seam's `surface_path_divisions`\ncount.\n\n- **Seamed sphere cap:** A sphere seam run through a pole now retains\nthe layout produced by `route_through_poles`. This prevents the UV\nboundary from collapsing to a line and makes the cap mesh its own\nhemisphere.\n\n- **V-closed bands:** NURBS bands closed along v now mesh closed between\ntheir rims. This covers both a surface extending beyond its rims,\npreviously meshed at area 351.3 instead of 251.3, and a surface spanning\nthe band exactly, previously meshed open. The true area is 251.33.\n\n- **Empty-face warning:** A solid face ending with no triangles logs a\nwarning containing the face and deflection. The check reads the mesh\nafter welding and before coincident triangle pairs are removed, so a\nshared internal wall whose triangles cancel is not reported as unmeshed.\n\n### Sampling and bounds\n\n`surface_path_divisions` and `iso_divisions_over` now test quarter-point\nsag as well as midpoint sag. This splits inflected spans whose midpoint\nlies on the chord. Only failing spans are halved. A span is accepted as\na crease once it is within the deflection, shorter than the deflection,\nand its halves retain most of its turn. For a degree-one dome profile\ncreased away from dyadic points, this reduces the boundary from 860\nsamples to 119.\n\n`SurfacePoles` now detects poles on u-closed NURBS surfaces when a\nv-domain endpoint's u iso-line collapses within `1e-6 * (1 + reach)`.\nPole routing, seam placement, and `seam_vertex_u` use those poles.\nVertices exactly at a pole and `1e-5` away both mesh closed through the\nCDT.\n\nAll mesher-derived counts for virtual seam and pole paths are bounded by\n`MAX_PATH_SPANS = 4096`. This includes joining-seam spans, pole rows,\nsphere meridian samples, and path-sampler starting and total spans. Zero\nor NaN rim spacing selects the bound.\n\n### Verification\n\nUsing the 4.2.0 reader, which returns millimetres, at 0.5, 0.1, 0.05,\nand 0.0125 mm:\n\n- `sled_base` faces 356 and 358 mesh at 330.3 to 332.8 mm2 each against\na true 333.0 mm2. Main produces 105.3 to 252.4 mm2.\n- At 0.5 mm, faces 357 and 359 mesh at 4.965 mm2 each against a true\n5.06 mm2. Main produces no triangles.\n- No other sled_base face changes.\n- `dome_nurbs` passes at all four tolerances. At 0.0125 mm its area is\n2513.0 against a true 2513.3, compared with 2725.7 on main.\n- `torus_ring_nurbs` passes at all four tolerances.\n\nPer-face triangle counts and areas remain identical to main at all four\ntolerances for `bowl_01`, `door_handle_guide`, `freeform_panel`,\n`hinge_jig`, `lego_3_pins`, `lego_4x2_01`, `rail_guide`, and the\ngenerated `dome`, `cylinder_nurbs`, `cylinder_seam`, `torus_ring`,\n`grooved_shaft`, and `plate_900_holes`. Across these parts plus the\nthree corrected parts, only sled_base faces 356 to 359 and the curved\nfaces of `dome_nurbs` and `torus_ring_nurbs` change. All 16 generated\nsolids of revolution pass at all four tolerances. The pose sweep prints\nthe same 495 lines on main and this branch.\n\nRegression tests: `a_fillet_closed_along_v_meshes_with_its_top` over\n`[-pi, pi]` and `[0, 1]`,\n`a_nurbs_dome_meshes_its_pole_closure_on_the_sphere`,\n`a_seamed_nurbs_dome_meshes_through_its_pole`,\n`a_nurbs_dome_samples_an_inflected_pole_closure`,\n`a_nurbs_torus_band_meshes_its_joining_seam_within_deflection`,\n`a_seamed_sphere_cap_meshes_its_own_hemisphere`,\n`a_nurbs_wall_closed_along_v_meshes_between_its_rims`,\n`only_a_face_left_genuinely_empty_is_reported_unmeshed`,\n`a_seam_beside_coinciding_samples_takes_bounded_spans`,\n`a_path_no_sampling_satisfies_takes_bounded_spans`, and\n`a_creased_path_is_not_halved_far_below_its_deflection`. Each fails\nwithout its corresponding fix. All `brepkit-operations` and `brepkit-io`\ntests pass, including 920 operations unit tests.\n\nThe branch includes current main and #2035, released in 4.2.0.\n\n### Not in this PR\n\n`freeform_panel` still fails because its side-wall boundary sample\nreaches a convergence failure in `project_point_to_surface` at every\ntolerance, aborting the wall CDT. The cause is projection seeding in\n`crates/math/src/nurbs/projection.rs`.\n\nThe reader-side gaps reported in #2033, including seams, units, assembly\nplacements, surface models, and surfaces of revolution, are addressed by\n#2035.\n\nA creased NURBS face's interior grid continues to fail its normal-turn\ncheck across the crease. A degree-one profile dome therefore takes about\n128k triangles at deflection 0.01. Cone apex-row counts and analytic\ninterior-grid counts remain outside `MAX_PATH_SPANS`. Both behaviors\nmatch main.\n\nPart of #2033.",
+          "timestamp": "2026-10-15T09:23:46Z",
+          "tree_id": "c43a4249775c2ef231022e9b64914f248a96a6ac",
+          "url": "https://github.com/andymai/brepkit/commit/41c7e5f10b9a6269a587a1cecdeffba07e3470dd"
+        },
+        "date": 1792056402493,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1072394,
+            "range": "± 2839",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1161837,
+            "range": "± 4374",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 13744,
+            "range": "± 76",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 773089,
+            "range": "± 3348",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 48128149,
+            "range": "± 51257",
             "unit": "ns/iter"
           }
         ]
