@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792088011166,
+  "lastUpdate": 1792089119219,
   "repoUrl": "https://github.com/andymai/brepkit",
   "entries": {
     "Boolean perf": [
@@ -54485,6 +54485,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 48761186,
             "range": "± 196548",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hi@andymai.com",
+            "name": "Andy Aragon",
+            "username": "andymai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d998af595ad429b63d6372f8f236ca032568f72f",
+          "message": "ci: run tests and coverage under a lightly optimized profile (#2040)\n\nThis change adds a `ci` Cargo profile and uses it for the Test job's\nworkspace and complexity-guard runs, plus the Coverage job's `cargo\nllvm-cov` commands. The profile inherits `dev` and sets `opt-level = 1`,\n`debug-assertions = true`, `overflow-checks = true`, `debug =\n\"line-tables-only\"`, and `incremental = false`. Doc tests remain on\n`dev`. Locally, the slowest test dropped from 129.4 s under `dev` to\n13.7 s under `ci`.\n\n### Why the jobs are slow\n\nOn main's last CI run, 38716555077:\n\n- The Test job compiled in 2m 12s, then ran 3,500 tests in 1,068.8 s.\n- Individual test durations summed to 4,278 s.\n- The 42 tests taking 30 s or more accounted for 2,581 s of that total.\n- The slowest test, `kumiko_wrap_slot_chain_stays_exact`, took 310 s.\n- The Coverage job ran from 09:56:55 to 10:48:51.\n- `CI Pass` requires the Coverage job, so every merge waits for it.\n\n### Measured\n\nLocal measurements on one machine:\n\n| Workload | Profile | Result |\n| --- | --- | --- |\n| `kumiko_wrap_slot_chain_stays_exact` | `dev` | 129.4 s |\n| `kumiko_wrap_slot_chain_stays_exact` | `ci` | 13.7 s |\n| Clean workspace build, 2 jobs | `ci` | 156 s |\n| 3,500 tests, 2 threads | `ci` | 116 s, all passing |\n| Sum of test durations | `ci` | 232 s |\n\n### Coverage\n\nCoverage remains measured by instrumentation under the `ci` profile. The\n60% line-coverage gate is unchanged.\n\nMain's last Coverage run measured 84.12% line coverage. This PR's\nCoverage run reports the corresponding figure under `ci`.\n\nThe checks relied on by the test suite remain enabled: debug assertions\nand integer overflow checks.\n\n<!-- This is an auto-generated description by cubic. -->\n---\n## Summary by cubic\nRuns the Test and Coverage jobs under a new lightly optimized `ci`\nprofile, cutting the slowest test locally from 129.4 s under `dev` to\n13.7 s.\n\n- The `ci` profile inherits `dev` with `opt-level = 1`, and keeps debug\nassertions and overflow checks enabled.\n- Doc tests run under `dev` as before.\n- Coverage stays instrumented under `ci`; the 60% line-coverage gate is\nunchanged.\n\n<sup>Written for commit 27f90146a457a6b928a37e6a996177514fd3f619.\nSummary will update on new commits.</sup>\n\n<a\nhref=\"https://cubic.dev/pr/andymai/brepkit/pull/2040?utm_source=github\"\ntarget=\"_blank\" rel=\"noopener noreferrer\"\ndata-no-image-dialog=\"true\"><picture><source\nmedia=\"(prefers-color-scheme: dark)\"\nsrcset=\"https://www.cubic.dev/buttons/review-in-cubic-dark.svg\"><source\nmedia=\"(prefers-color-scheme: light)\"\nsrcset=\"https://www.cubic.dev/buttons/review-in-cubic-light.svg\"><img\nalt=\"View guided diff\"\nsrc=\"https://www.cubic.dev/buttons/review-in-cubic-light.svg\"></picture></a>\n<a\nhref=\"https://www.cubic.dev/action/auto-fix/pr/andymai/brepkit/2040?returnTo=https%3A%2F%2Fgithub.com%2Fandymai%2Fbrepkit%2Fpull%2F2040&source=description\"\ntarget=\"_blank\" rel=\"noopener noreferrer\"\ndata-no-image-dialog=\"true\"><picture><source\nmedia=\"(prefers-color-scheme: dark)\"\nsrcset=\"https://www.cubic.dev/buttons/turn-on-auto-fix-dark.svg\"><source\nmedia=\"(prefers-color-scheme: light)\"\nsrcset=\"https://www.cubic.dev/buttons/turn-on-auto-fix-light.svg\"><img\nalt=\"Turn on auto-fix\"\nsrc=\"https://www.cubic.dev/buttons/turn-on-auto-fix-light.svg\"></picture></a>\n\n<!-- End of auto-generated description by cubic. -->",
+          "timestamp": "2026-10-15T18:29:06Z",
+          "tree_id": "7b48381645396f7ea1815acac2f8a33a83fd489f",
+          "url": "https://github.com/andymai/brepkit/commit/d998af595ad429b63d6372f8f236ca032568f72f"
+        },
+        "date": 1792089112177,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 932826,
+            "range": "± 20619",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1045858,
+            "range": "± 26396",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 11086,
+            "range": "± 142",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 669367,
+            "range": "± 13478",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 44984931,
+            "range": "± 1118574",
             "unit": "ns/iter"
           }
         ]
