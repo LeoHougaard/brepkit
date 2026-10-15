@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792058289828,
+  "lastUpdate": 1792088011166,
   "repoUrl": "https://github.com/andymai/brepkit",
   "entries": {
     "Boolean perf": [
@@ -54431,6 +54431,60 @@ window.BENCHMARK_DATA = {
             "name": "boolean/perforated_cut_36",
             "value": 31266936,
             "range": "± 792806",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hi@andymai.com",
+            "name": "Andy Aragon",
+            "username": "andymai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d50265dcbcd252f5212b7ec596eb68ca7380bbad",
+          "message": "fix: mesh the folded freeform panel within tolerance (#2039)\n\nThis fixes the last part of #2033 still failing, `freeform_panel`. The\nconformance suite's RESULTS.md measures brepkit 14.374 mm off at 0.0125,\n0.05, and 0.1 mm, with a missing face at 0.5 mm, and 4.2.1 still meshes\nthe outer wall whole. The corrected mesh is within the suite limit at\nall four tolerances, with a worst distance of 0.020 mm at 0.0125 mm.\n\n`freeform_panel` is a synthetic CC0 tray with two cubic B-spline walls,\na B-spline floor, two planar caps, and no pcurves. Its fitted rims trim\nthe walls at z = 0 and z = 44 mm. Near the foot, the outer wall folds\nover and its bottom rim curls through itself, winding once around the\nbase and twice around a curl of about 2 mm².\n\n### Causes and fixes\n\n- **Projection:** `project_point_to_surface` seeded Newton from an 8 x 8\ngrid, while the outer wall has 120 knot spans around it. The seeds were\nabout 15 spans apart. Of 2001 samples along each rim, 35 bottom samples\nand 71 top samples did not converge. Other samples converged to points\nup to 234 mm away. This error sent the face to the untrimmed fallback,\nproducing an outer wall from z = -10.791 to 58.374. The 14.374 mm excess\nabove z = 44 matches the suite error.\n\nA result farther than the tolerance is now checked against knot-span\npatches. When all weights are positive, each patch lies within the box\nof its control points. Candidate patches whose boxes can improve the\nresult by more than the tolerance are searched nearest first, using a 3\nx 3 sample and damped Gauss-Newton descent that never moves farther from\nthe point. Patches holding the current result are skipped, and only\nfinite results are accepted. Step halving is limited to 64 attempts, and\na nonpositive tolerance skips the search. A NaN point still fails. The\nexisting grid-seeded Newton path remains first, so points already on the\nsurface return as before. All rim samples now project, with a worst\nerror of 5.2e-4 mm, matching the gap between the fitted rim curves and\nthe surface.\n\n- **The base:** The base outline crosses itself at the curl at every\ntolerance. `cdt_triangulate_simple` therefore used its corner fan\nfallback, producing 96,202.110 mm² of triangles at 0.0125 mm for a rim\nwinding once around 86,255.6 mm². Some points were 7.07 mm outside the\npart.\n\nA planar face without holes whose outline crosses itself now joins the\nplanar CDT jobs. The CDT retains each crossing vertex, lifts it to 3D,\nand splices it into neighboring faces' edge samples before those faces\nmesh. Triangles are retained where the outline has odd winding and\nreversed where it winds backward, so their sides oppose their walls. A\ncrossing vertex is spliced into every edge chain on which it lies,\nexcept a chain containing both crossing sides. For a self-crossing edge,\nthe wall cannot distinguish which rim pass owns the vertex, and splicing\nproduced a wall triangle 0.55 mm off the part.\n\nCrossing outlines mesh in a first pass, allowing planar faces with holes\nto collect outlines after shared edges contain the crossing vertices. An\nunrecoverable crossing outline still uses the fan fallback.\n`tessellate_planar` applies the same coverage rule, but keeps a backward\nlobe facing with the face because it has no walls and assigns every\nvertex the face normal.\n\n- **The weld:** `weld_boundary_vertices` treated an edge used by two\ntriangles in the same direction as a crack. The base and outer wall use\nthe curl edges in the same direction, so samples closer than twice the\ndeflection were merged and wall triangles at the fold were deleted. At\n0.1 mm, the fold tip was 0.711 mm from the mesh. A crack is now defined\nas an edge used by only one triangle.\n\n### Results\n\nThe local probe ports the suite's exact-shape scoring and makes the\nadapter's calls. Its reference uses a fine mesh of the true B-spline\nwalls and floor at 0.5 µm sag, with even-odd caps.\n\n| tolerance | worst distance | limit |\n| --- | ---: | ---: |\n| 0.5 mm | 0.190 mm | 2.0 mm |\n| 0.1 mm | 0.063 mm | 0.4 mm |\n| 0.05 mm | 0.045 mm | 0.2 mm |\n| 0.0125 mm | 0.020 mm | 0.05 mm |\n\nReading and meshing take 1.0 s at 0.0125 mm.\n\n### Test changes\n\n- `pinched_ledge_prism_is_watertight` still requires no open edges. Its\nprevious fan covered 73.6 mm² for a 36.3 mm² ledge. The test now\nrequires each cap to match the ledge area within 1% and permits edges\nshared by more than two triangles only on the vertical lines where the\ntwo crossing walls pass through each other.\n- `regress_fillet_variable_retry_seam_stub` now records blend-face gaps\nfalling from 28 to 4 and from 36 to 10 open half-edges. Its bow-tie\nfloor has a self-crossing outline whose crossing vertices now reach\nneighboring faces.\n- `rolling_reference_diagnostic_result_is_measurable` now measures\n32,006.275 instead of 27,435.645 because some planar faces in the\ndeprecated rolling-ball engine's degenerate diagnostic solid have\ncrossing outlines.\n\nNew regression tests cover many-span wall projection, NaN and\nzero-tolerance projection behavior, curl exclusion from a crossing cap,\npropagation of crossing vertices to an adjacent holed wall, and\n`freeform_panel` at all four suite tolerances. Each test fails when its\ncorresponding fix is removed. The full panel test separately detects\nremoval of the projection search, planar routing, splice exception, and\nweld rule.\n\n### Cost\n\nFor release projection onto the panel's NURBS faces, on-surface points\ntake 8.7 to 14.3 µs, compared with 8.3 to 9.8 µs before. Points at mesh\ntriangle centers or 3 mm off the surface take 17 to 82 µs, compared with\n8 to 13 µs.\n\nThe 413 single-threaded `brepkit-io` tests take 100.89 s with patch\nsearch enabled and 98.86 s with it disabled. The new fixture test\naccounts for 2.01 s of that difference.\n\n### Verification\n\n- The full workspace suite passes, totaling 3,505 tests.\n- The math and operations unit tests pass in a debug build, totaling\n1,460 tests.\n- Per-face triangle counts and areas match main at all four tolerances\nfor `sled_base`, `bowl_01`, `door_handle_guide`, `hinge_jig`,\n`lego_3_pins`, `lego_4x2_01`, `rail_guide`, and the generated dome,\n`cylinder_nurbs`, `cylinder_seam`, `torus_ring`, `dome_nurbs`,\n`torus_ring_nurbs`, `grooved_shaft`, and `plate_900_holes`. Only\n`freeform_panel` changes.\n- All 16 generated solids of revolution pass at all four tolerances.\n- The pose sweep prints the same 495 lines on main and this branch.\n\nCloses #2033.",
+          "timestamp": "2026-10-15T18:10:23Z",
+          "tree_id": "34cdf977cd3379084bde66cf7cd6e6c1eaf683d3",
+          "url": "https://github.com/andymai/brepkit/commit/d50265dcbcd252f5212b7ec596eb68ca7380bbad"
+        },
+        "date": 1792088004449,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "boolean/cut_box_box",
+            "value": 1038769,
+            "range": "± 5197",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/fuse_box_box",
+            "value": 1133267,
+            "range": "± 4433",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/intersect_box_box",
+            "value": 12392,
+            "range": "± 142",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/cut_cylinder_through_box",
+            "value": 744215,
+            "range": "± 3625",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "boolean/perforated_cut_36",
+            "value": 48761186,
+            "range": "± 196548",
             "unit": "ns/iter"
           }
         ]
