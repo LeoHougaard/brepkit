@@ -1623,13 +1623,12 @@ fn collect_var_v_ring(
     if gids.len() < 3 {
         return Ok(None);
     }
+    let poles = SurfacePoles::of(surface);
     let us: Vec<Option<f64>> = gids
         .iter()
         .map(|&g| {
             let point = merged.positions[g as usize];
-            sphere_pole_v(surface, point)
-                .is_none()
-                .then(|| project(point).0)
+            poles.v_of(point).is_none().then(|| project(point).0)
         })
         .collect();
     let (_, winding) = unwrap_loop_u(&us, TAU);
@@ -1845,11 +1844,107 @@ fn cdt_trace() -> bool {
 /// re-meshing the face with `tessellate_nonplanar_snap`, which is watertight
 /// but honours no deflection bound, so the stripe case logs a warning first
 /// and the sag leaves a trace.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn tessellate_nonplanar_cdt(
     topo: &Topology,
     face_id: FaceId,
     face_data: &brepkit_topology::face::Face,
+    deflection: f64,
+    angular_tol: f64,
+    circle_floor: bool,
+    edge_global_indices: &DetHashMap<usize, Vec<u32>>,
+    merged: &mut TriangleMesh,
+    point_to_global: &mut DetHashMap<(i64, i64, i64), u32>,
+) -> Result<(), crate::OperationsError> {
+    // Every seam, pole and winding-loop rule below reads the closed direction
+    // as u. A NURBS face closed along v alone (a revolved fillet whose profile
+    // runs along u) is meshed on the same surface with its parameters
+    // exchanged, which leaves every point and normal where it was.
+    if let FaceSurface::Nurbs(nurbs) = face_data.surface()
+        && nurbs.is_periodic_v()
+        && !nurbs.is_periodic_u()
+    {
+        let (exchanged, mirror) = exchange_nurbs_parameters(nurbs)?;
+        let mut local = face_data.clone();
+        local.set_surface(FaceSurface::Nurbs(exchanged));
+        let pcurve_uv = |edge: brepkit_topology::edge::EdgeId, pt: Point3| {
+            topo.pcurves()
+                .get(edge, face_id)
+                .and_then(|pcurve| project_via_pcurve(pcurve, pt, face_data.surface()))
+                .map(|(u, v)| (v, mirror - u))
+        };
+        return cdt_in_surface_frame(
+            topo,
+            face_id,
+            &local,
+            &pcurve_uv,
+            deflection,
+            angular_tol,
+            circle_floor,
+            edge_global_indices,
+            merged,
+            point_to_global,
+        );
+    }
+    let pcurve_uv = |edge: brepkit_topology::edge::EdgeId, pt: Point3| {
+        topo.pcurves()
+            .get(edge, face_id)
+            .and_then(|pcurve| project_via_pcurve(pcurve, pt, face_data.surface()))
+    };
+    cdt_in_surface_frame(
+        topo,
+        face_id,
+        face_data,
+        &pcurve_uv,
+        deflection,
+        angular_tol,
+        circle_floor,
+        edge_global_indices,
+        merged,
+        point_to_global,
+    )
+}
+
+/// A NURBS surface with its parameters exchanged, `T(p, q) = S(mirror - q,
+/// p)`, and that `mirror`. Running the old u backwards keeps `dT/dp x dT/dq`
+/// equal to `dS/du x dS/dv`, so the normal does not flip, and keeps the new
+/// v on the old u's domain.
+fn exchange_nurbs_parameters(
+    nurbs: &brepkit_math::nurbs::surface::NurbsSurface,
+) -> Result<(brepkit_math::nurbs::surface::NurbsSurface, f64), crate::OperationsError> {
+    let (u_lo, u_hi) = nurbs.domain_u();
+    let mirror = u_lo + u_hi;
+    let points = nurbs.control_points();
+    let weights = nurbs.weights();
+    let cols = points.first().map_or(0, Vec::len);
+    let control_points = (0..cols)
+        .map(|j| points.iter().rev().map(|row| row[j]).collect())
+        .collect();
+    let exchanged_weights = (0..cols)
+        .map(|j| weights.iter().rev().map(|row| row[j]).collect())
+        .collect();
+    let knots_v = nurbs.knots_u().iter().rev().map(|k| mirror - k).collect();
+    let exchanged = brepkit_math::nurbs::surface::NurbsSurface::new(
+        nurbs.degree_v(),
+        nurbs.degree_u(),
+        nurbs.knots_v().to_vec(),
+        knots_v,
+        control_points,
+        exchanged_weights,
+    )
+    .map_err(crate::OperationsError::Math)?;
+    Ok((exchanged, mirror))
+}
+
+/// The CDT mesher proper, for a face whose closed direction (if any) is u.
+/// `pcurve_uv` gives an edge sample's `(u, v)` from the edge's pcurve on the
+/// face, in this frame.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn cdt_in_surface_frame(
+    topo: &Topology,
+    face_id: FaceId,
+    face_data: &brepkit_topology::face::Face,
+    pcurve_uv: &dyn Fn(brepkit_topology::edge::EdgeId, Point3) -> Option<(f64, f64)>,
     deflection: f64,
     angular_tol: f64,
     circle_floor: bool,
@@ -1990,13 +2085,8 @@ pub(super) fn tessellate_nonplanar_cdt(
         boundary_3d
             .iter()
             .map(|(pt, _, edge_id_local, _)| {
-                if let Some(pcurve) = topo.pcurves().get(*edge_id_local, face_id) {
-                    let uv = project_via_pcurve(pcurve, *pt, face_data.surface());
-                    if let Some(uv) = uv {
-                        return Ok(uv);
-                    }
-                }
-                project_to_surface_uv(face_data.surface(), *pt)
+                pcurve_uv(*edge_id_local, *pt)
+                    .map_or_else(|| project_to_surface_uv(face_data.surface(), *pt), Ok)
             })
             .collect::<Result<Vec<_>, _>>()?
     };
@@ -2045,9 +2135,10 @@ pub(super) fn tessellate_nonplanar_cdt(
                 u -= shifts * u_period;
                 boundary_uv[i].0 = u;
             }
-            // A sphere's pole has no u of its own: a loop through it runs
-            // along the pole's row, which also keeps a loop that opens a
-            // wedge at the pole from reading as a cap over it.
+            // A pole (a sphere's, or a u-closed NURBS cap's) has no u of its
+            // own: a loop through it runs along the pole's row, which also
+            // keeps a loop that opens a wedge at the pole from reading as a
+            // cap over it.
             let points: Vec<Point3> = boundary_3d.iter().map(|b| b.0).collect();
             if let Some(routed) =
                 route_through_poles(face_data.surface(), &boundary_uv, &points, u_period)
@@ -2170,9 +2261,14 @@ pub(super) fn tessellate_nonplanar_cdt(
             // section winds round the off-seam samples would put a copy on
             // the section's sample nearest the seam.
             let seam_vertex_u = seam_vertex_u(topo, &edges, face_data.surface())?;
+            let u_period = surface_periods(face_data.surface())
+                .0
+                .map_or(TAU, |(_, period)| period);
             let (u_min_bnd, u_max_bnd) = seam_vertex_u.map_or((u_min_bnd, u_max_bnd), |seam_u| {
-                let lo = ((u_min_bnd - seam_u) / TAU).round().mul_add(TAU, seam_u);
-                (lo, lo + TAU)
+                let lo = ((u_min_bnd - seam_u) / u_period)
+                    .round()
+                    .mul_add(u_period, seam_u);
+                (lo, lo + u_period)
             });
             // A rim's seam vertex joins whichever run the wire reaches it in,
             // so when both rims hand theirs to the seam runs, the rims' span
@@ -2254,7 +2350,21 @@ pub(super) fn tessellate_nonplanar_cdt(
                 }
                 _ => None,
             };
+            let poles = SurfacePoles::of(face_data.surface());
             for run in &seam_runs {
+                // A seam up to a sphere's or NURBS cap's pole and back is one
+                // run, which `route_through_poles` has already laid out: each
+                // half on its own copy of the seam, at the u its unwrap
+                // reached, and the pole opened into the stretch of its row
+                // between them. One u for the whole run would fold it onto a
+                // line.
+                if run
+                    .indices
+                    .iter()
+                    .any(|&i| poles.v_of(boundary_3d[i].0).is_some())
+                {
+                    continue;
+                }
                 // The rim sample just before the run is the seam's own vertex
                 // on that rim, already unwrapped to the seam's side of the
                 // span; the edge's sense only says which side for one wire
@@ -2401,7 +2511,8 @@ pub(super) fn tessellate_nonplanar_cdt(
                 for i in (0..n_boundary).filter(|&i| off_seam(i)) {
                     if on_seam.contains(&boundary_3d[i].1) && !at_apex(boundary_3d[i].0) {
                         let u = boundary_uv[i].0;
-                        boundary_uv[i].0 = ((u - seam_u) / TAU).round().mul_add(TAU, seam_u);
+                        boundary_uv[i].0 =
+                            ((u - seam_u) / u_period).round().mul_add(u_period, seam_u);
                     }
                 }
             }
@@ -2523,6 +2634,7 @@ pub(super) fn tessellate_nonplanar_cdt(
         topo,
         face_id,
         face_data,
+        pcurve_uv,
         (u_min, u_max, v_min, v_max),
         deflection,
         angular_tol,
@@ -2536,6 +2648,8 @@ pub(super) fn tessellate_nonplanar_cdt(
         &mut holes,
         &mut boundary_uv,
         &mut boundary_3d,
+        deflection,
+        angular_tol,
         merged,
         point_to_global,
     );
@@ -3204,8 +3318,9 @@ fn notched_pointed_cone(
     Ok(false)
 }
 
-/// The u of a cylinder's or cone's seam, read off a vertex of an edge its
-/// wire runs both ways, away from a cone's apex.
+/// The u of a cylinder's, cone's or u-closed NURBS face's seam, read off a
+/// vertex of an edge its wire runs both ways, away from a cone's apex or a
+/// NURBS pole, where u means nothing.
 fn seam_vertex_u(
     topo: &Topology,
     edges: &[brepkit_topology::wire::OrientedEdge],
@@ -3214,8 +3329,10 @@ fn seam_vertex_u(
     let apex = match surface {
         FaceSurface::Cone(cone) => Some(cone.apex()),
         FaceSurface::Cylinder(_) => None,
+        FaceSurface::Nurbs(_) if surface_periods(surface).0.is_some() => None,
         _ => return Ok(None),
     };
+    let poles = SurfacePoles::of(surface);
     for (i, oe) in edges.iter().enumerate() {
         if edges[i + 1..].iter().all(|other| other.edge() != oe.edge()) {
             continue;
@@ -3223,9 +3340,10 @@ fn seam_vertex_u(
         let edge = topo.edge(oe.edge())?;
         for v in [edge.start(), edge.end()] {
             let p = topo.vertex(v)?.point();
-            if apex.is_none_or(|a| (p - a).length() >= 1e-9)
-                && let Some((u, _)) = surface.project_point(p)
-            {
+            if apex.is_some_and(|a| (p - a).length() < 1e-9) || poles.v_of(p).is_some() {
+                continue;
+            }
+            if let Ok((u, _)) = project_to_surface_uv(surface, p) {
                 return Ok(Some(u));
             }
         }
@@ -3512,6 +3630,7 @@ fn inner_wire_uv_loops(
     topo: &Topology,
     face_id: FaceId,
     face_data: &brepkit_topology::face::Face,
+    pcurve_uv: &dyn Fn(brepkit_topology::edge::EdgeId, Point3) -> Option<(f64, f64)>,
     (u_min, u_max, v_min, v_max): (f64, f64, f64, f64),
     deflection: f64,
     angular_tol: f64,
@@ -3580,11 +3699,8 @@ fn inner_wire_uv_loops(
         let mut loop_uv: Vec<(f64, f64, u32)> = Vec::with_capacity(samples.len());
         for (gid, edge) in samples {
             let pt = merged.positions[gid as usize];
-            let (mut u, mut v) = match topo.pcurves().get(edge, face_id) {
-                Some(pcurve) => project_via_pcurve(pcurve, pt, face_data.surface()),
-                None => None,
-            }
-            .map_or_else(|| project_to_surface_uv(face_data.surface(), pt), Ok)?;
+            let (mut u, mut v) = pcurve_uv(edge, pt)
+                .map_or_else(|| project_to_surface_uv(face_data.surface(), pt), Ok)?;
             if let Some(&(pu, pv, _)) = loop_uv.last() {
                 if let Some((_, period)) = u_period {
                     u -= ((u - pu) / period).round() * period;
@@ -3659,7 +3775,11 @@ fn close_loop_at_pole(
     let mut meridian_radius = None;
     let (evaluate, (v_lo, v_hi)): (SurfacePoint<'_>, (f64, f64)) = match face_data.surface() {
         FaceSurface::Nurbs(nurbs) if face_data.inner_wires().is_empty() => {
-            (Box::new(|u, v| nurbs.evaluate(u, v)), nurbs.domain_v())
+            let surface = face_data.surface();
+            (
+                Box::new(move |u, v| eval_surface_point(surface, u, v)),
+                nurbs.domain_v(),
+            )
         }
         FaceSurface::Sphere(sphere) => {
             let Some(spans) = hole_u_spans(topo, face_data, sphere)? else {
@@ -3723,9 +3843,10 @@ fn close_loop_at_pole(
     let first_v = boundary_uv[0].1;
     boundary_uv.push((first_u + winding, first_v));
     boundary_3d.push((first_pt, first_gid, edge, true));
-    // A sphere's closing meridian is a real arc: sampled, one side's points
-    // welding to the other's, so no triangle chords it from rim to pole.
-    let side: Vec<(f64, Point3, u32)> = match meridian_radius {
+    // The closing meridian is a real curve on the surface: sampled like an
+    // edge, one side's points welding to the other's, so no triangle chords
+    // it from rim to pole.
+    let along: Vec<f64> = match meridian_radius {
         Some(radius) => {
             let n = segments_for_chord_deviation_a(
                 radius,
@@ -3734,27 +3855,34 @@ fn close_loop_at_pole(
                 angular_tol,
                 false,
             )
-            .max(2);
-            (1..n)
-                .map(|k| {
-                    #[allow(clippy::cast_precision_loss)]
-                    let v = first_v + (v_far - first_v) * k as f64 / n as f64;
-                    let p = evaluate(first_u, v);
-                    let id = *point_to_global
-                        .entry(point_merge_key(p, MERGE_GRID))
-                        .or_insert_with(|| {
-                            #[allow(clippy::cast_possible_truncation)]
-                            let idx = merged.positions.len() as u32;
-                            merged.positions.push(p);
-                            merged.normals.push(Vec3::new(0.0, 0.0, 0.0));
-                            idx
-                        });
-                    (v, p, id)
-                })
-                .collect()
+            .clamp(2, MAX_PATH_SPANS);
+            #[allow(clippy::cast_precision_loss)]
+            (1..n).map(|k| k as f64 / n as f64).collect()
         }
-        None => Vec::new(),
+        None => surface_path_parameters(
+            &|t| evaluate(first_u, first_v + (v_far - first_v) * t),
+            deflection,
+            angular_tol,
+            1,
+        ),
     };
+    let side: Vec<(f64, Point3, u32)> = along
+        .iter()
+        .map(|&t| {
+            let v = first_v + (v_far - first_v) * t;
+            let p = evaluate(first_u, v);
+            let id = *point_to_global
+                .entry(point_merge_key(p, MERGE_GRID))
+                .or_insert_with(|| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let idx = merged.positions.len() as u32;
+                    merged.positions.push(p);
+                    merged.normals.push(Vec3::new(0.0, 0.0, 0.0));
+                    idx
+                });
+            (v, p, id)
+        })
+        .collect();
     for &(v, p, id) in &side {
         boundary_uv.push((first_u + winding, v));
         boundary_3d.push((p, id, edge, true));
@@ -4008,7 +4136,7 @@ fn hole_u_spans(
     sphere: &brepkit_math::surfaces::SphericalSurface,
 ) -> Result<Option<Vec<(f64, f64)>>, crate::OperationsError> {
     const SAMPLES: u32 = 16;
-    let surface = face_data.surface();
+    let poles = SurfacePoles::of(face_data.surface());
     let mut spans = Vec::new();
     for &wire_id in face_data.inner_wires() {
         let mut us: Vec<Option<f64>> = Vec::new();
@@ -4036,7 +4164,8 @@ fn hole_u_spans(
                     .curve()
                     .evaluate_with_endpoints(t0 + (t1 - t0) * f, start, end);
                 us.push(
-                    sphere_pole_v(surface, point)
+                    poles
+                        .v_of(point)
                         .is_none()
                         .then(|| sphere.project_point(point).0),
                 );
@@ -4060,15 +4189,65 @@ fn hole_u_spans(
     Ok(Some(spans))
 }
 
-/// The v of the sphere pole `point` lies on, if it lies on one.
-fn sphere_pole_v(surface: &FaceSurface, point: Point3) -> Option<f64> {
-    let FaceSurface::Sphere(sphere) = surface else {
-        return None;
-    };
-    let tol = MERGE_GRID.max(1e-9 * sphere.radius());
-    [std::f64::consts::FRAC_PI_2, -std::f64::consts::FRAC_PI_2]
-        .into_iter()
-        .find(|&v| (sphere.evaluate(0.0, v) - point).length() <= tol)
+/// The poles of a surface whose u closes: each `(v, point)` at which a whole
+/// u iso-line collapses to one point (a sphere's two, a revolved NURBS
+/// profile's ends on the axis), and how near a point must lie to one to be
+/// on it, where its u means nothing.
+struct SurfacePoles {
+    poles: Vec<(f64, Point3)>,
+    tol: f64,
+}
+
+impl SurfacePoles {
+    fn of(surface: &FaceSurface) -> Self {
+        match surface {
+            FaceSurface::Sphere(sphere) => Self {
+                poles: [std::f64::consts::FRAC_PI_2, -std::f64::consts::FRAC_PI_2]
+                    .into_iter()
+                    .map(|v| (v, sphere.evaluate(0.0, v)))
+                    .collect(),
+                tol: MERGE_GRID.max(1e-9 * sphere.radius()),
+            },
+            FaceSurface::Nurbs(nurbs) if surface_periods(surface).0.is_some() => {
+                // A vertex a file puts on the pole sits there only to its
+                // own tolerance, so the pole is read geometrically.
+                let reach = nurbs
+                    .control_points()
+                    .iter()
+                    .flatten()
+                    .fold(0.0_f64, |m, p| {
+                        m.max(p.x().abs()).max(p.y().abs()).max(p.z().abs())
+                    });
+                let tol = 1e-6 * (1.0 + reach);
+                let (u_lo, u_hi) = nurbs.domain_u();
+                let (v_lo, v_hi) = nurbs.domain_v();
+                let poles = [v_lo, v_hi]
+                    .into_iter()
+                    .filter_map(|v| {
+                        let at = nurbs.evaluate(u_lo, v);
+                        (1..8)
+                            .all(|k| {
+                                let u = u_lo + (u_hi - u_lo) * f64::from(k) / 8.0;
+                                (nurbs.evaluate(u, v) - at).length() <= tol
+                            })
+                            .then_some((v, at))
+                    })
+                    .collect();
+                Self { poles, tol }
+            }
+            _ => Self {
+                poles: Vec::new(),
+                tol: 0.0,
+            },
+        }
+    }
+
+    fn v_of(&self, point: Point3) -> Option<f64> {
+        self.poles
+            .iter()
+            .find(|(_, pole)| (point - *pole).length() <= self.tol)
+            .map(|&(v, _)| v)
+    }
 }
 
 /// The parameters strictly inside a circle edge's domain `(t0, t1)` at which
@@ -4129,18 +4308,19 @@ fn unwrap_loop_u(us: &[Option<f64>], period: f64) -> (Vec<(f64, f64)>, f64) {
     (out, last - first + wrap(first - last))
 }
 
-/// A sphere loop through a pole, unwrapped by `unwrap_loop_u` with each
-/// pole sample opened into the stretch of the pole's row the loop runs
-/// along, sampled as densely as the pole closure's row: `(source sample, u,
-/// v)` per routed sample. `None` when no sample, or every sample, lies on a
-/// pole.
+/// A loop through a pole of a sphere or a u-closed NURBS cap (see
+/// [`SurfacePoles`]), unwrapped by `unwrap_loop_u` with each pole sample
+/// opened into the stretch of the pole's row the loop runs along, sampled as
+/// densely as the pole closure's row: `(source sample, u, v)` per routed
+/// sample. `None` when no sample, or every sample, lies on a pole.
 fn route_through_poles(
     surface: &FaceSurface,
     uv: &[(f64, f64)],
     points: &[Point3],
     period: f64,
 ) -> Option<Vec<(usize, f64, f64)>> {
-    let pole_v: Vec<Option<f64>> = points.iter().map(|&p| sphere_pole_v(surface, p)).collect();
+    let poles = SurfacePoles::of(surface);
+    let pole_v: Vec<Option<f64>> = points.iter().map(|&p| poles.v_of(p)).collect();
     if pole_v.iter().all(Option::is_none) || pole_v.iter().all(Option::is_some) {
         return None;
     }
@@ -4159,7 +4339,7 @@ fn route_through_poles(
             continue;
         };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let n = ((u_out - u_in).abs() / period * steps).ceil() as usize;
+        let n = (((u_out - u_in).abs() / period * steps).ceil() as usize).min(MAX_PATH_SPANS);
         routed.extend((0..=n).map(|k| {
             #[allow(clippy::cast_precision_loss)]
             let f = if n == 0 { 0.0 } else { k as f64 / n as f64 };
@@ -4305,11 +4485,14 @@ fn nurbs_speeds(
 /// starts at the one keeping farthest from every boundary sample, and the
 /// other holes move by whole periods into the rotated loop's span.
 /// Returns whether the loops were joined.
+#[allow(clippy::too_many_arguments)]
 fn join_winding_hole(
     face_data: &brepkit_topology::face::Face,
     holes: &mut Vec<HoleLoop>,
     boundary_uv: &mut Vec<(f64, f64)>,
     boundary_3d: &mut Vec<(Point3, u32, brepkit_topology::edge::EdgeId, bool)>,
+    deflection: f64,
+    angular_tol: f64,
     merged: &mut TriangleMesh,
     point_to_global: &mut DetHashMap<(i64, i64, i64), u32>,
 ) -> bool {
@@ -4448,7 +4631,9 @@ fn join_winding_hole(
         prev_u = u;
     }
 
-    // Seam samples, spaced like the outer loop's.
+    // Seam samples, spaced like the outer loop's, and as finely as the seam
+    // bends: across a tightly curved band (a torus's tube) the rims' spacing
+    // leaves chords that cut far inside the surface.
     let (_, first_gid, _, _) = boundary_3d[0];
     let spacing = boundary_3d
         .windows(2)
@@ -4459,12 +4644,21 @@ fn join_winding_hole(
     let (hole_u, hole_v, hole_gid) = hole_uv[0];
     let reach =
         (merged.positions[hole_gid as usize] - merged.positions[first_gid as usize]).length();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let steps = ((reach / spacing.max(1e-12)).ceil() as usize).max(2);
-    let seam: Vec<(f64, f64, u32)> = (1..steps)
-        .map(|k| {
-            #[allow(clippy::cast_precision_loss)]
-            let t = k as f64 / steps as f64;
+    let along = surface_path_parameters(
+        &|t| {
+            eval_surface_point(
+                surface,
+                top_u + (hole_u - top_u) * t,
+                top_v + (hole_v - top_v) * t,
+            )
+        },
+        deflection,
+        angular_tol,
+        seam_spans(reach, spacing),
+    );
+    let seam: Vec<(f64, f64, u32)> = along
+        .iter()
+        .map(|&t| {
             let (u, v) = (top_u + (hole_u - top_u) * t, top_v + (hole_v - top_v) * t);
             let pt = eval_surface_point(surface, u, v);
             let gid = *point_to_global
@@ -4496,6 +4690,95 @@ fn join_winding_hole(
         push(u - w_outer, v, gid);
     }
     true
+}
+
+/// The most spans a virtual boundary the mesher runs across a face is cut
+/// into, whatever its geometry asks: a degenerate or hostile face (rims whose
+/// samples all but coincide, a loop that winds without end) must not size
+/// the samples it allocates and evaluates from a ratio without bound.
+const MAX_PATH_SPANS: usize = 4096;
+
+/// Equal spans for a seam `reach` long beside boundary samples `spacing`
+/// apart: as many as the spacing asks, at least two and at most
+/// [`MAX_PATH_SPANS`].
+fn seam_spans(reach: f64, spacing: f64) -> usize {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let spans = (reach / spacing.max(1e-12)).ceil() as usize;
+    spans.clamp(2, MAX_PATH_SPANS)
+}
+
+/// Where to sample a path `point(t)` across a surface, as the parameters
+/// strictly inside `(0, 1)`, to the bounds an edge is sampled to: each chord
+/// within `deflection` of the path and turning by at most `angular_tol`. A
+/// virtual boundary the mesher runs across a face (a pole closure's
+/// meridian, a seam joining two loops) borders triangles like an edge does.
+///
+/// The path starts as `min_spans` equal spans and each span that fails is
+/// halved. A span is read at its quarter points: an inflected path can cross
+/// its chord at the middle and still stand far off it either side. A crease
+/// (a cornered or degree-one profile) keeps its turn however finely it is
+/// halved, so a span already within the deflection and shorter than it,
+/// whose halves keep most of its turn, stands as it is; the halving it took
+/// to get there stays beside the crease. However the path behaves, it is cut
+/// into at most [`MAX_PATH_SPANS`] spans.
+fn surface_path_parameters(
+    point: &dyn Fn(f64) -> Point3,
+    deflection: f64,
+    angular_tol: f64,
+    min_spans: usize,
+) -> Vec<f64> {
+    const MAX_DEPTH: u32 = 12;
+    // The half-chords of an arc meet at half its turn.
+    let turn =
+        |a: Point3, mid: Point3, b: Point3| match ((mid - a).normalize(), (b - mid).normalize()) {
+            (Ok(x), Ok(y)) => 2.0 * x.dot(y).clamp(-1.0, 1.0).acos(),
+            _ => 0.0,
+        };
+    let off_chord = |p: Point3, a: Point3, b: Point3| {
+        let chord = b - a;
+        let len2 = chord.dot(chord);
+        let f = if len2 > 0.0 {
+            ((p - a).dot(chord) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (p - (a + chord * f)).length()
+    };
+    let spans = min_spans.clamp(1, MAX_PATH_SPANS);
+    let mut pending: Vec<(f64, Point3, f64, Point3, u32)> = Vec::new();
+    for k in (0..spans).rev() {
+        #[allow(clippy::cast_precision_loss)]
+        let (t0, t1) = (k as f64 / spans as f64, (k + 1) as f64 / spans as f64);
+        pending.push((t0, point(t0), t1, point(t1), 0));
+    }
+    let mut along = Vec::new();
+    while let Some((t0, p0, t1, p1, depth)) = pending.pop() {
+        let quarters = [1.0, 2.0, 3.0].map(|k| point(t0 + (t1 - t0) * k / 4.0));
+        let chord = (p1 - p0).length();
+        let deviation = quarters
+            .iter()
+            .map(|&q| off_chord(q, p0, p1))
+            .fold(0.0, f64::max);
+        let bend = turn(p0, quarters[1], p1);
+        let within = deviation <= deflection;
+        let bends = angular_tol > 0.0 && bend > angular_tol;
+        let crease = within
+            && bends
+            && chord <= deflection
+            && turn(p0, quarters[0], quarters[1]).max(turn(quarters[1], quarters[2], p1))
+                > 0.75 * bend;
+        let room = along.len() + pending.len() + 2 <= MAX_PATH_SPANS;
+        if (within && (!bends || crease)) || depth >= MAX_DEPTH || !room {
+            if t1 < 1.0 {
+                along.push(t1);
+            }
+            continue;
+        }
+        let tm = 0.5 * (t0 + t1);
+        pending.push((tm, quarters[1], t1, p1, depth + 1));
+        pending.push((t0, p0, tm, quarters[1], depth + 1));
+    }
+    along
 }
 
 /// Whether the open segments `a b` and `c d` cross in the plane.
@@ -5004,4 +5287,72 @@ pub(super) fn tessellate_nonplanar_snap(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_seam_beside_coinciding_samples_takes_bounded_spans() {
+        assert_eq!(seam_spans(10.0, 4.0), 3);
+        assert_eq!(seam_spans(1e-9, 4.0), 2);
+        assert_eq!(seam_spans(10.0, 0.0), MAX_PATH_SPANS);
+        assert_eq!(seam_spans(10.0, f64::NAN), MAX_PATH_SPANS);
+        assert_eq!(seam_spans(f64::INFINITY, 1.0), MAX_PATH_SPANS);
+        assert_eq!(seam_spans(f64::NAN, 1.0), 2);
+    }
+
+    #[test]
+    fn a_path_no_sampling_satisfies_takes_bounded_spans() {
+        let started = std::time::Instant::now();
+        // Straight but started from as many spans as a degenerate seam could
+        // ask for.
+        let straight =
+            surface_path_parameters(&|t| Point3::new(t, 0.0, 0.0), 1e-3, 0.35, usize::MAX);
+        assert_eq!(straight.len(), MAX_PATH_SPANS - 1);
+        // So wild that no span ever sits within the deflection, from the
+        // most spans allowed.
+        let wild = surface_path_parameters(
+            &|t| Point3::new(t, (1e9 * t).sin(), (3e9 * t).cos()),
+            1e-12,
+            1e-6,
+            MAX_PATH_SPANS,
+        );
+        assert!(wild.len() < MAX_PATH_SPANS);
+        assert!(wild.windows(2).all(|w| w[0] < w[1]));
+        let unknown = surface_path_parameters(&|_| Point3::new(f64::NAN, 0.0, 0.0), 1e-3, 0.35, 1);
+        assert!(unknown.len() < MAX_PATH_SPANS);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_creased_path_is_not_halved_far_below_its_deflection() {
+        // A degree-one profile's corner turns as sharply however finely the
+        // span across it is halved, and sits off every dyadic parameter.
+        let creased = |t: f64| {
+            if t <= 1.0 / 3.0 {
+                Point3::new(3.0 * t, 0.0, 0.0)
+            } else {
+                Point3::new(1.0, 1.5 * (t - 1.0 / 3.0), 0.0)
+            }
+        };
+        let deflection = 0.01;
+        let along = surface_path_parameters(&creased, deflection, 0.35, 1);
+        let ts: Vec<f64> = std::iter::once(0.0)
+            .chain(along)
+            .chain(std::iter::once(1.0))
+            .collect();
+        for w in ts.windows(2) {
+            let (a, b) = (creased(w[0]), creased(w[1]));
+            let chord = (b - a).length();
+            assert!(chord > deflection / 8.0, "span {w:?} halved to {chord}");
+            for k in 1..8 {
+                let p = creased(w[0] + (w[1] - w[0]) * f64::from(k) / 8.0);
+                let f = ((p - a).dot(b - a) / chord.powi(2)).clamp(0.0, 1.0);
+                let off = (p - (a + (b - a) * f)).length();
+                assert!(off <= deflection, "span {w:?} stands {off} off its chord");
+            }
+        }
+    }
 }
