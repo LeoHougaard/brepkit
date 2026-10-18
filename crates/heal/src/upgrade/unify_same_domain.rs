@@ -561,20 +561,6 @@ fn merge_group_with_holes(
 
     let lin = options.linear_tolerance;
 
-    // This reconstructor classifies loops as straight UV polygons. Retain
-    // exact curved planar domains until it has curve-aware classification;
-    // treating a conic arc as its chord can change the material region.
-    for &fid in group_face_ids {
-        let face = topo.face(fid)?;
-        for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
-            for oe in topo.wire(wid)?.edges() {
-                if !matches!(topo.edge(oe.edge())?.curve(), EdgeCurve::Line) {
-                    return Ok(None);
-                }
-            }
-        }
-    }
-
     // XOR edge selection across outer + inner wires of every member face,
     // preserving each surviving edge's orientation as it appeared.
     let mut all_oes: Vec<OrientedEdge> = Vec::new();
@@ -598,6 +584,15 @@ fn merge_group_with_holes(
 
     if surviving.is_empty() {
         return Ok(None);
+    }
+
+    // Classify only the surviving boundary as straight UV polygons. Curved
+    // internal seams cancel exactly before this check; a curved surviving
+    // boundary must retain its original domain until classification supports it.
+    for oe in &surviving {
+        if !matches!(topo.edge(oe.edge())?.curve(), EdgeCurve::Line) {
+            return Ok(None);
+        }
     }
 
     let to_uv = |p: brepkit_math::vec::Point3| -> (f64, f64) {
@@ -1185,6 +1180,62 @@ mod hole_merge_tests {
         let shell = topo.add_shell(Shell::new(vec![left, right]).unwrap());
         let solid = topo.add_solid(Solid::new(shell, vec![]));
         (topo, solid)
+    }
+
+    #[test]
+    fn same_domain_cancels_curved_internal_seams_before_classifying_the_boundary() {
+        for reversed in [false, true] {
+            let mut topo = Topology::new();
+            let vertices: Vec<_> = [(0., 0.), (4., 0.), (4., 2.), (0., 2.)]
+                .into_iter()
+                .map(|(x, y)| add_vertex(&mut topo, x, y))
+                .collect();
+            let edges: Vec<_> = (0..4)
+                .map(|i| (line(&mut topo, vertices[i], vertices[(i + 1) % 4]), true))
+                .collect();
+            let outer = loop_of(&mut topo, &edges);
+            let start = add_vertex(&mut topo, 1.5, 1.);
+            let circle = brepkit_math::curves::Circle3D::new(
+                Point3::new(1., 1., 0.),
+                Vec3::new(0., 0., 1.),
+                0.5,
+            )
+            .unwrap();
+            let seam = topo.add_edge(Edge::new(start, start, EdgeCurve::Circle(circle)));
+            let hole = loop_of(&mut topo, &[(seam, false)]);
+            let disk = loop_of(&mut topo, &[(seam, true)]);
+            let make_face = |outer, inner| {
+                if reversed {
+                    Face::new_reversed(outer, inner, plane_z0())
+                } else {
+                    Face::new(outer, inner, plane_z0())
+                }
+            };
+            let annulus = topo.add_face(make_face(outer, vec![hole]));
+            let disk = topo.add_face(make_face(disk, vec![]));
+            let shell = topo.add_shell(Shell::new(vec![annulus, disk]).unwrap());
+            let solid = topo.add_solid(Solid::new(shell, vec![]));
+            let (_, result) =
+                unify_same_domain(&mut topo, solid, &UnifyOptions::default()).unwrap();
+            assert_eq!(result.faces_merged, 1);
+            let faces = topo.shell(shell).unwrap().faces();
+            assert_eq!(faces.len(), 1);
+            let face = topo.face(faces[0]).unwrap();
+            assert_eq!(face.is_reversed(), reversed);
+            assert!(face.inner_wires().is_empty());
+            let boundary = topo.wire(face.outer_wire()).unwrap().edges();
+            assert_eq!(boundary.len(), 4);
+            assert!(
+                boundary
+                    .iter()
+                    .all(|oe| edges.iter().any(|&(id, _)| id == oe.edge()))
+            );
+            assert_eq!(topo.face(annulus).unwrap().inner_wires(), &[hole]);
+            assert!(matches!(
+                topo.edge(seam).unwrap().curve(),
+                EdgeCurve::Circle(_)
+            ));
+        }
     }
 
     #[test]
