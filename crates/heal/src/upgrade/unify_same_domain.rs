@@ -10,8 +10,8 @@
 use std::collections::{HashMap, HashSet};
 
 use brepkit_topology::Topology;
-use brepkit_topology::edge::{Edge, EdgeCurve};
-use brepkit_topology::face::FaceId;
+use brepkit_topology::edge::{Edge, EdgeCurve, EdgeId};
+use brepkit_topology::face::{FaceId, FaceSurface};
 use brepkit_topology::shell::Shell;
 use brepkit_topology::solid::SolidId;
 use brepkit_topology::wire::{OrientedEdge, Wire, WireId};
@@ -121,7 +121,7 @@ pub fn unify_same_domain(
     let face_ids: Vec<FaceId> = shell.faces().to_vec();
     let n_faces = face_ids.len();
 
-    if n_faces < 2 {
+    if n_faces == 0 {
         return Ok((
             solid_id,
             UnifyResult {
@@ -132,17 +132,23 @@ pub fn unify_same_domain(
         ));
     }
 
-    let mut edge_faces: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut edge_faces: HashMap<EdgeId, Vec<(usize, bool)>> = HashMap::new();
     for (fi, &fid) in face_ids.iter().enumerate() {
         let face = topo.face(fid)?;
         let wire = topo.wire(face.outer_wire())?;
         for oe in wire.edges() {
-            edge_faces.entry(oe.edge().index()).or_default().push(fi);
+            edge_faces
+                .entry(oe.edge())
+                .or_default()
+                .push((fi, oe.is_forward()));
         }
         for &iw_id in face.inner_wires() {
             let iw = topo.wire(iw_id)?;
             for oe in iw.edges() {
-                edge_faces.entry(oe.edge().index()).or_default().push(fi);
+                edge_faces
+                    .entry(oe.edge())
+                    .or_default()
+                    .push((fi, oe.is_forward()));
             }
         }
     }
@@ -159,11 +165,30 @@ pub fn unify_same_domain(
         ..brepkit_math::tolerance::Tolerance::new()
     };
 
-    for faces in edge_faces.values() {
+    for (&edge_id, faces) in &edge_faces {
         if faces.len() == 2 {
-            let fi = faces[0];
-            let fj = faces[1];
-            if fi != fj && surfaces_equivalent(&face_surfaces[fi], &face_surfaces[fj], &tol) {
+            let fi = faces[0].0;
+            let fj = faces[1].0;
+            if fi == fj || !same_support(&face_surfaces[fi], &face_surfaces[fj], &tol) {
+                continue;
+            }
+            let edge = topo.edge(edge_id)?;
+            let point = topo.vertex(edge.start())?.point();
+            let normal = |i: usize| -> Result<_, HealError> {
+                let surface = &face_surfaces[i];
+                let n = if let FaceSurface::Plane { normal, .. } = surface {
+                    *normal
+                } else if let Some((u, v)) = surface.project_point(point) {
+                    surface.normal(u, v)
+                } else {
+                    return Ok(None);
+                };
+                let reversed = topo.face(face_ids[i])?.is_reversed();
+                Ok(n.normalize().ok().map(|n| if reversed { -n } else { n }))
+            };
+            if let (Some(a), Some(b)) = (normal(fi)?, normal(fj)?)
+                && a.dot(b) > 1.0 - options.angular_tolerance
+            {
                 uf.union(fi, fj);
             }
         }
@@ -179,7 +204,20 @@ pub fn unify_same_domain(
     // unstable order makes sequential booleans non-deterministic across
     // processes. Each group's first element is its minimum face index (members
     // are pushed in 0..n order), giving a stable key to sort on.
-    let mut merge_groups: Vec<Vec<usize>> = groups.into_values().filter(|g| g.len() > 1).collect();
+    // A planar contour may encode an inner loop with a bridge traversed in
+    // both directions. Such a bridge bounds no material; split it into explicit
+    // outer/inner wires even when there is only one face on this support.
+    let bridged_faces: HashSet<usize> = edge_faces
+        .values()
+        .filter(|uses| uses.len() == 2 && uses[0].0 == uses[1].0 && uses[0].1 != uses[1].1)
+        .map(|uses| uses[0].0)
+        .collect();
+    let mut merge_groups: Vec<Vec<usize>> = groups
+        .into_values()
+        .filter(|g| {
+            g.len() > 1 || (face_surfaces[g[0]].is_planar() && bridged_faces.contains(&g[0]))
+        })
+        .collect();
     merge_groups.sort_unstable_by_key(|g| g[0]);
 
     if merge_groups.is_empty() {
@@ -230,7 +268,7 @@ pub fn unify_same_domain(
         for &fid in &group_face_ids {
             faces_to_remove.insert(fid);
         }
-        total_merged += group_face_ids.len() - new_face_ids.len();
+        total_merged += group_face_ids.len().saturating_sub(new_face_ids.len());
         new_faces_to_add.extend(new_face_ids);
     }
 
@@ -244,21 +282,23 @@ pub fn unify_same_domain(
     // unpaired. That is invisible on analytic solids (few collinear runs) and
     // catastrophic on mesh-fallback ones (thousands of coplanar facets: 1630
     // edge merges orphaned 4574 edges on a drilled 15648-face solid).
+    let changed_faces = !faces_to_remove.is_empty();
+    let mut final_faces = Vec::new();
     let mut bad_after_faces = 0;
-    if total_merged > 0 {
+    if changed_faces {
         let shell = topo.shell(shell_id)?;
         let current_faces: Vec<FaceId> = shell.faces().to_vec();
         let bad_before = unpaired_edge_count(topo, &current_faces)?;
 
-        let mut final_faces: Vec<FaceId> = current_faces
+        final_faces = current_faces
             .iter()
             .copied()
             .filter(|f| !faces_to_remove.contains(f))
             .collect();
         final_faces.extend(&new_faces_to_add);
 
-        // Removed faces are only dropped from the shell's list, never deleted
-        // from the arena, so restoring that list is a complete revert.
+        // Validate candidate membership before publishing it. Original faces
+        // and their wires remain allocated and unchanged.
         bad_after_faces = unpaired_edge_count(topo, &final_faces)?;
         if bad_after_faces > bad_before {
             log::warn!(
@@ -273,13 +313,10 @@ pub fn unify_same_domain(
                 },
             ));
         }
-        let new_shell = Shell::new(final_faces)?;
-        let shell_mut = topo.shell_mut(shell_id)?;
-        *shell_mut = new_shell;
     }
 
     let mut total_edges_merged = 0;
-    if options.unify_edges && total_merged > 0 {
+    if options.unify_edges && changed_faces {
         // `merge_collinear_edges` rewrites each wire in place under the same
         // WireId, so snapshotting the wires is enough to undo just this phase
         // and keep the face merges above.
@@ -294,8 +331,7 @@ pub fn unify_same_domain(
         }
 
         if total_edges_merged > 0 {
-            let faces_now: Vec<FaceId> = topo.shell(shell_id)?.faces().to_vec();
-            let bad_after_edges = unpaired_edge_count(topo, &faces_now)?;
+            let bad_after_edges = unpaired_edge_count(topo, &final_faces)?;
             if bad_after_edges > bad_after_faces {
                 log::warn!(
                     "unify_same_domain: reverting {total_edges_merged} collinear-edge merges — unpaired edges would rise {bad_after_faces} -> {bad_after_edges} (face merges kept)"
@@ -309,7 +345,15 @@ pub fn unify_same_domain(
         }
     }
 
-    let status = if total_merged > 0 || total_edges_merged > 0 {
+    if changed_faces {
+        // Publish only after every fallible face/edge operation has completed.
+        // Existing faces and wires are immutable throughout candidate building,
+        // so any earlier error leaves the input's reachable topology untouched.
+        let new_shell = Shell::new(final_faces)?;
+        *topo.shell_mut(shell_id)? = new_shell;
+    }
+
+    let status = if changed_faces || total_edges_merged > 0 {
         Status::DONE1
     } else {
         Status::OK
@@ -323,6 +367,23 @@ pub fn unify_same_domain(
             status,
         },
     ))
+}
+
+/// Exact refinement uses the requested tolerance, rather than the relaxed
+/// plane equivalence intended for repairing tessellated geometry.
+fn same_support(
+    a: &FaceSurface,
+    b: &FaceSurface,
+    tol: &brepkit_math::tolerance::Tolerance,
+) -> bool {
+    if let (FaceSurface::Plane { normal: na, d: da }, FaceSurface::Plane { normal: nb, d: db }) =
+        (a, b)
+    {
+        let dot = na.dot(*nb);
+        (dot.abs() - 1.0).abs() < tol.angular && (da - db * dot.signum()).abs() < tol.linear
+    } else {
+        surfaces_equivalent(a, b, tol)
+    }
 }
 
 /// Count edges of `faces` that are NOT shared by exactly two of them.
@@ -343,6 +404,30 @@ fn unpaired_edge_count(topo: &Topology, faces: &[FaceId]) -> Result<usize, HealE
     Ok(uses.values().filter(|&&c| c != 2).count())
 }
 
+/// Cancel only oppositely oriented internal coedges. Same-sense repeats and
+/// non-manifold edge uses do not define a valid boundary for reconstruction.
+fn exterior_edges(edges: &[OrientedEdge]) -> Option<Vec<OrientedEdge>> {
+    let mut uses: HashMap<EdgeId, (usize, i32)> = HashMap::new();
+    for oe in edges {
+        let entry = uses.entry(oe.edge()).or_default();
+        entry.0 += 1;
+        entry.1 += if oe.is_forward() { 1 } else { -1 };
+    }
+    if uses
+        .values()
+        .any(|&(count, balance)| count > 2 || (count == 2 && balance != 0))
+    {
+        return None;
+    }
+    Some(
+        edges
+            .iter()
+            .copied()
+            .filter(|oe| uses[&oe.edge()].0 == 1)
+            .collect(),
+    )
+}
+
 /// Merge a hole-free group on a curved (non-planar) surface.
 ///
 /// Surviving edges (referenced exactly once across the group) are emitted as a
@@ -353,22 +438,19 @@ fn merge_group_simple(
     group_face_ids: &[FaceId],
     surface: &brepkit_topology::face::FaceSurface,
 ) -> Result<Option<Vec<FaceId>>, HealError> {
-    let mut edge_count: HashMap<usize, usize> = HashMap::new();
     let mut all_oes: Vec<OrientedEdge> = Vec::new();
 
     for &fid in group_face_ids {
         let face = topo.face(fid)?;
         let wire = topo.wire(face.outer_wire())?;
         for oe in wire.edges() {
-            *edge_count.entry(oe.edge().index()).or_insert(0) += 1;
             all_oes.push(*oe);
         }
     }
 
-    let boundary_edges: Vec<OrientedEdge> = all_oes
-        .into_iter()
-        .filter(|oe| edge_count.get(&oe.edge().index()).copied().unwrap_or(0) == 1)
-        .collect();
+    let Some(boundary_edges) = exterior_edges(&all_oes) else {
+        return Ok(None);
+    };
 
     if boundary_edges.is_empty() {
         return Ok(None);
@@ -479,38 +561,40 @@ fn merge_group_with_holes(
 
     let lin = options.linear_tolerance;
 
+    // This reconstructor classifies loops as straight UV polygons. Retain
+    // exact curved planar domains until it has curve-aware classification;
+    // treating a conic arc as its chord can change the material region.
+    for &fid in group_face_ids {
+        let face = topo.face(fid)?;
+        for wid in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
+            for oe in topo.wire(wid)?.edges() {
+                if !matches!(topo.edge(oe.edge())?.curve(), EdgeCurve::Line) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
     // XOR edge selection across outer + inner wires of every member face,
     // preserving each surviving edge's orientation as it appeared.
-    let mut edge_count: HashMap<usize, usize> = HashMap::new();
     let mut all_oes: Vec<OrientedEdge> = Vec::new();
     for &fid in group_face_ids {
         let face = topo.face(fid)?;
         let wire = topo.wire(face.outer_wire())?;
         for oe in wire.edges() {
-            *edge_count.entry(oe.edge().index()).or_insert(0) += 1;
             all_oes.push(*oe);
         }
         for &iw_id in face.inner_wires() {
             let iw = topo.wire(iw_id)?;
             for oe in iw.edges() {
-                *edge_count.entry(oe.edge().index()).or_insert(0) += 1;
                 all_oes.push(*oe);
             }
         }
     }
 
-    if edge_count.values().any(|&c| c > 2) {
-        log::warn!(
-            "unify_same_domain: skipping group with {} faces (non-manifold edge)",
-            group_face_ids.len()
-        );
+    let Some(surviving) = exterior_edges(&all_oes) else {
         return Ok(None);
-    }
-
-    let surviving: Vec<OrientedEdge> = all_oes
-        .into_iter()
-        .filter(|oe| edge_count.get(&oe.edge().index()).copied().unwrap_or(0) == 1)
-        .collect();
+    };
 
     if surviving.is_empty() {
         return Ok(None);
@@ -528,30 +612,6 @@ fn merge_group_with_holes(
         let end = oe.oriented_end(edge);
         let sp = topo.vertex(start)?.point();
         let ep = topo.vertex(end)?.point();
-        // A full circle is stored as a CLOSED edge: start == end with a zero
-        // chord, which the degenerate-sliver test below cannot tell it apart
-        // from. Sampling the curve interior separates them (the endpoints of a
-        // closed curve carry no extent — see the closed-edge rule in
-        // CLAUDE.md). Such a loop is a real boundary, typically a bore opening,
-        // but it reaches the loop walk as a SINGLE-VERTEX loop, and the
-        // containment classification below needs a UV polygon with area to
-        // decide outer-vs-hole. Dropping the edge instead would erase the hole
-        // and orphan its rim — a drilled pad annulus merged into its coplanar
-        // neighbour leaves the bore rim used once (free) — so defer the whole
-        // group rather than merge it wrongly.
-        if start == end {
-            let (t0, t1) = edge.curve().domain_with_endpoints(sp, ep);
-            let mid = edge
-                .curve()
-                .evaluate_with_endpoints(0.5 * (t0 + t1), sp, ep);
-            if (mid - sp).length() > lin {
-                log::debug!(
-                    "unify_same_domain: deferring group of {} faces (closed-curve boundary loop)",
-                    group_face_ids.len()
-                );
-                return Ok(None);
-            }
-        }
         if (ep - sp).length() < lin && start == end {
             continue;
         }
@@ -659,12 +719,12 @@ fn merge_group_with_holes(
             return Ok(None);
         };
         for j in 0..n_loops {
-            if i == j {
-                continue;
-            }
-            if point_in_polygon(sample, &infos[j].uv_points) {
-                is_outer[i] = false;
-                break;
+            // An outer loop's sample may fall inside a smaller hole. Only a
+            // strictly larger loop can contain this entire boundary.
+            if infos[j].signed_area.abs() > infos[i].signed_area.abs() + lin * lin
+                && point_in_polygon(sample, &infos[j].uv_points)
+            {
+                is_outer[i] = !is_outer[i];
             }
         }
     }
@@ -684,9 +744,13 @@ fn merge_group_with_holes(
         };
         let mut owner: Option<usize> = None;
         for &o in &outer_indices {
-            if point_in_polygon(sample, &infos[o].uv_points) {
+            if infos[o].signed_area.abs() > infos[h].signed_area.abs() + lin * lin
+                && point_in_polygon(sample, &infos[o].uv_points)
+                && owner.is_none_or(|previous| {
+                    infos[o].signed_area.abs() < infos[previous].signed_area.abs()
+                })
+            {
                 owner = Some(o);
-                break;
             }
         }
         if let Some(o) = owner {
@@ -784,19 +848,26 @@ fn polygon_signed_area(pts: &[(f64, f64)]) -> f64 {
     acc * 0.5
 }
 
-/// A representative interior point of a UV polygon (centroid; falls back to the
-/// midpoint of the first edge for non-convex shapes by nudging inward).
+/// Find an interior sample, checking candidates against the polygon itself.
+/// A simple polygon has an ear, so one consecutive-triangle centroid is inside
+/// even when the overall vertex centroid falls outside a concave boundary.
 fn loop_interior_point(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
     if pts.len() < 3 {
         return None;
     }
-    // Midpoint of the first edge nudged toward the polygon centroid keeps the
-    // sample strictly inside even for non-convex loops.
-    let cx: f64 = pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64;
-    let cy: f64 = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
-    let mid = ((pts[0].0 + pts[1].0) * 0.5, (pts[0].1 + pts[1].1) * 0.5);
-    let sample = (mid.0 * 0.001 + cx * 0.999, mid.1 * 0.001 + cy * 0.999);
-    Some(sample)
+    let center = (
+        pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64,
+        pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64,
+    );
+    if point_in_polygon(center, pts) {
+        return Some(center);
+    }
+    (0..pts.len())
+        .map(|i| {
+            let (a, b, c) = (pts[i], pts[(i + 1) % pts.len()], pts[(i + 2) % pts.len()]);
+            ((a.0 + b.0 + c.0) / 3.0, (a.1 + b.1 + c.1) / 3.0)
+        })
+        .find(|&p| point_in_polygon(p, pts))
 }
 
 /// Even-odd point-in-polygon test in UV.
@@ -1067,6 +1138,238 @@ mod hole_merge_tests {
         }
     }
 
+    fn joined_panels(
+        slope: f64,
+        reversed: bool,
+        opposite_parameterization: bool,
+    ) -> (Topology, SolidId) {
+        let mut topo = Topology::default();
+        let vertices: Vec<_> = [
+            (0., 0., 0.),
+            (1., 0., 0.),
+            (2., 0., slope),
+            (2., 1., slope),
+            (1., 1., 0.),
+            (0., 1., 0.),
+        ]
+        .into_iter()
+        .map(|(x, y, z)| topo.add_vertex(Vertex::new(Point3::new(x, y, z), 1e-7)))
+        .collect();
+        let shared = line(&mut topo, vertices[1], vertices[4]);
+        let lb = line(&mut topo, vertices[0], vertices[1]);
+        let lt = line(&mut topo, vertices[4], vertices[5]);
+        let ll = line(&mut topo, vertices[5], vertices[0]);
+        let left = loop_of(
+            &mut topo,
+            &[(lb, true), (shared, true), (lt, true), (ll, true)],
+        );
+        let rb = line(&mut topo, vertices[1], vertices[2]);
+        let rr = line(&mut topo, vertices[2], vertices[3]);
+        let rt = line(&mut topo, vertices[3], vertices[4]);
+        let right = loop_of(
+            &mut topo,
+            &[(rb, true), (rr, true), (rt, true), (shared, false)],
+        );
+        let left = topo.add_face(Face::new(left, vec![], plane_z0()));
+        let sign = if opposite_parameterization { -1. } else { 1. };
+        let normal = Vec3::new(-slope, 0., 1.).normalize().unwrap() * sign;
+        let surface = FaceSurface::Plane {
+            normal,
+            d: -slope / (1. + slope * slope).sqrt() * sign,
+        };
+        let right = topo.add_face(if reversed {
+            Face::new_reversed(right, vec![], surface)
+        } else {
+            Face::new(right, vec![], surface)
+        });
+        let shell = topo.add_shell(Shell::new(vec![left, right]).unwrap());
+        let solid = topo.add_solid(Solid::new(shell, vec![]));
+        (topo, solid)
+    }
+
+    #[test]
+    fn same_domain_retains_exact_curved_planar_domains() {
+        let mut topo = Topology::new();
+        let vertices: Vec<_> = [(1., 0.), (0., 1.), (-1., 0.), (0., -1.)]
+            .into_iter()
+            .map(|(x, y)| add_vertex(&mut topo, x, y))
+            .collect();
+        let circle =
+            brepkit_math::curves::Circle3D::new(Point3::new(0., 0., 0.), Vec3::new(0., 0., 1.), 1.)
+                .unwrap();
+        let arcs: Vec<_> = (0..4)
+            .map(|i| {
+                topo.add_edge(Edge::new(
+                    vertices[i],
+                    vertices[(i + 1) % 4],
+                    EdgeCurve::Circle(circle.clone()),
+                ))
+            })
+            .collect();
+        let diameter = line(&mut topo, vertices[2], vertices[0]);
+        let upper = loop_of(
+            &mut topo,
+            &[(arcs[0], true), (arcs[1], true), (diameter, true)],
+        );
+        let lower = loop_of(
+            &mut topo,
+            &[(arcs[2], true), (arcs[3], true), (diameter, false)],
+        );
+        let a = topo.add_face(Face::new(upper, vec![], plane_z0()));
+        let b = topo.add_face(Face::new(lower, vec![], plane_z0()));
+        let shell = topo.add_shell(Shell::new(vec![a, b]).unwrap());
+        let solid = topo.add_solid(Solid::new(shell, vec![]));
+        let (_, result) = unify_same_domain(&mut topo, solid, &UnifyOptions::default()).unwrap();
+        assert_eq!(result.faces_merged, 0);
+        assert_eq!(topo.shell(shell).unwrap().faces(), &[a, b]);
+        assert_eq!(topo.face(a).unwrap().outer_wire(), upper);
+        assert_eq!(topo.face(b).unwrap().outer_wire(), lower);
+        assert!(
+            arcs.iter()
+                .all(|&id| matches!(topo.edge(id).unwrap().curve(), EdgeCurve::Circle(_)))
+        );
+    }
+
+    #[test]
+    fn same_domain_extracts_a_bridged_inner_boundary() {
+        for reversed in [false, true] {
+            let mut topo = Topology::new();
+            let vertices: Vec<_> = [
+                (0., 0.),
+                (8., 0.),
+                (8., 8.),
+                (0., 8.),
+                (3., 3.),
+                (3., 5.),
+                (5., 5.),
+                (5., 3.),
+            ]
+            .into_iter()
+            .map(|(x, y)| add_vertex(&mut topo, x, y))
+            .collect();
+            let mut outer = vec![];
+            for i in 0..4 {
+                outer.push((line(&mut topo, vertices[i], vertices[(i + 1) % 4]), true));
+            }
+            let bridge = line(&mut topo, vertices[0], vertices[4]);
+            outer.push((bridge, true));
+            for i in 0..4 {
+                outer.push((
+                    line(&mut topo, vertices[4 + i], vertices[4 + (i + 1) % 4]),
+                    true,
+                ));
+            }
+            outer.push((bridge, false));
+            let wire = loop_of(&mut topo, &outer);
+            let face = topo.add_face(if reversed {
+                Face::new_reversed(wire, vec![], plane_z0())
+            } else {
+                Face::new(wire, vec![], plane_z0())
+            });
+            let shell = topo.add_shell(Shell::new(vec![face]).unwrap());
+            let solid = topo.add_solid(Solid::new(shell, vec![]));
+            let mut malformed = topo.clone();
+            let mut same_sense = malformed.wire(wire).unwrap().edges().to_vec();
+            *same_sense.last_mut().unwrap() = OrientedEdge::new(bridge, true);
+            *malformed.wire_mut(wire).unwrap() = Wire::new(same_sense, true).unwrap();
+            unify_same_domain(&mut malformed, solid, &UnifyOptions::default()).unwrap();
+            let unchanged = malformed.shell(shell).unwrap().faces()[0];
+            assert_eq!(malformed.face(unchanged).unwrap().outer_wire(), wire);
+            assert!(exterior_edges(&[OrientedEdge::new(bridge, true); 2]).is_none());
+            let (_, result) =
+                unify_same_domain(&mut topo, solid, &UnifyOptions::default()).unwrap();
+            assert_eq!(result.faces_merged, 0);
+            let face = topo.face(topo.shell(shell).unwrap().faces()[0]).unwrap();
+            assert_ne!(face.outer_wire(), wire);
+            assert_eq!(face.is_reversed(), reversed);
+            assert_eq!(face.inner_wires().len(), 1);
+            assert_eq!(topo.wire(face.outer_wire()).unwrap().edges().len(), 4);
+            assert_eq!(topo.wire(face.inner_wires()[0]).unwrap().edges().len(), 4);
+            assert_eq!(topo.wire(wire).unwrap().edges().len(), 10);
+        }
+        let concave = [
+            (0., 0.),
+            (8., 0.),
+            (8., 2.),
+            (2., 2.),
+            (2., 6.),
+            (8., 6.),
+            (8., 8.),
+            (0., 8.),
+        ];
+        assert!(!point_in_polygon((4.5, 4.), &concave));
+        assert!(point_in_polygon(
+            loop_interior_point(&concave).unwrap(),
+            &concave
+        ));
+    }
+
+    #[test]
+    fn same_domain_only_replaces_shell_membership() {
+        for (slope, expected) in [(0.0, 1), (1e-4, 0)] {
+            let (mut topo, solid) = joined_panels(slope, false, false);
+            let faces: Vec<_> = topo
+                .faces()
+                .iter()
+                .map(|(id, f)| (id, format!("{f:?}")))
+                .collect();
+            let wires: Vec<_> = topo
+                .wires()
+                .iter()
+                .map(|(id, w)| (id, format!("{w:?}")))
+                .collect();
+            let edges: Vec<_> = topo
+                .edges()
+                .iter()
+                .map(|(id, e)| (id, format!("{e:?}")))
+                .collect();
+            let (_, result) =
+                unify_same_domain(&mut topo, solid, &UnifyOptions::default()).unwrap();
+            assert_eq!(result.faces_merged, expected);
+            for (id, before) in faces {
+                assert_eq!(format!("{:?}", topo.face(id).unwrap()), before);
+            }
+            for (id, before) in wires {
+                assert_eq!(format!("{:?}", topo.wire(id).unwrap()), before);
+            }
+            for (id, before) in edges {
+                assert_eq!(format!("{:?}", topo.edge(id).unwrap()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn same_domain_respects_the_requested_geometric_tolerance() {
+        let (mut topo, solid) = joined_panels(1e-4, false, false);
+        let (_, result) = unify_same_domain(&mut topo, solid, &UnifyOptions::default()).unwrap();
+        assert_eq!(
+            result.faces_merged, 0,
+            "A small dihedral is still two distinct supporting planes"
+        );
+        assert_eq!(
+            topo.shell(topo.solid(solid).unwrap().outer_shell())
+                .unwrap()
+                .faces()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn same_domain_preserves_material_side_across_surface_parameterizations() {
+        for (reverse, surface_flip, expected) in
+            [(true, false, 0), (true, true, 1), (false, false, 1)]
+        {
+            let (mut topo, solid) = joined_panels(0., reverse, surface_flip);
+            let (_, result) =
+                unify_same_domain(&mut topo, solid, &UnifyOptions::default()).unwrap();
+            assert_eq!(
+                result.faces_merged, expected,
+                "reversed={reverse}, opposite parameterization={surface_flip}"
+            );
+        }
+    }
+
     #[test]
     fn unify_two_coplanar_faces_sharing_a_hole_merges_outer_and_preserves_inner_wire() {
         // Left face spans x∈[0,2], right face spans x∈[2,4], both y∈[0,2],
@@ -1261,7 +1564,7 @@ mod merge_tests {
     use brepkit_math::curves::{Circle3D, Ellipse3D};
     use brepkit_math::vec::{Point3, Vec3};
     use brepkit_topology::Topology;
-    use brepkit_topology::edge::{Edge, EdgeCurve};
+    use brepkit_topology::edge::{Edge, EdgeCurve, EdgeId};
     use brepkit_topology::vertex::{Vertex, VertexId};
     use brepkit_topology::wire::{OrientedEdge, Wire};
 

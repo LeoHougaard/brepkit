@@ -1064,6 +1064,14 @@ fn loop_containment(loop_pts: &[Point2], outer: &[Point2]) -> LoopContainment {
     }
 }
 
+/// A sample inside an opening does not prove the surrounding region is there.
+/// The boundary must be contained too before an in-hole island is discarded.
+fn region_inside_hole(region: &[Point2], hole: &[Point2], sample: Point2, clearance: f64) -> bool {
+    loop_containment(region, hole) != LoopContainment::Outside
+        && super::classify_2d::point_in_polygon_2d(sample, hole)
+        && super::classify_2d::distance_to_polygon_boundary(sample, hole) > clearance
+}
+
 /// Whether a `(u, v)` point lies inside a loop on a surface periodic in u
 /// (and in v, a torus): a hole's samples and a split piece's outer wire can sit
 /// whole turns apart when one was unwrapped into another period, so the point
@@ -8523,10 +8531,9 @@ fn split_face_2d_impl(
             let poly = sample_wire_loop_uv_via_frame(&outer_wire, frame);
             if poly.len() >= 3 {
                 let ip = super::classify_2d::sample_interior_point(&poly);
-                let matched_hole = hole_polys_for_discard.iter().find(|hp| {
-                    super::classify_2d::point_in_polygon_2d(ip, hp)
-                        && super::classify_2d::distance_to_polygon_boundary(ip, hp) > hole_margin
-                });
+                let matched_hole = hole_polys_for_discard
+                    .iter()
+                    .find(|hp| region_inside_hole(&poly, hp, ip, hole_margin));
                 if let Some(hole_poly) = matched_hole {
                     if trace_split {
                         log::debug!(
@@ -9711,6 +9718,28 @@ mod tests {
     use brepkit_math::curves2d::Line2D;
     use brepkit_math::vec::Vec2;
     use brepkit_topology::test_utils::make_unit_square_face;
+
+    #[test]
+    fn a_region_surrounding_an_opening_is_not_an_in_hole_island() {
+        let square = |r: f64| {
+            [
+                Point2::new(-r, -r),
+                Point2::new(r, -r),
+                Point2::new(r, r),
+                Point2::new(-r, r),
+            ]
+        };
+        let (outer, hole, island) = (square(4.), square(1.), square(0.5));
+        let sample = Point2::new(0., 0.);
+        assert!(super::super::classify_2d::point_in_polygon_2d(
+            sample, &outer
+        ));
+        assert!(super::super::classify_2d::point_in_polygon_2d(
+            sample, &hole
+        ));
+        assert!(!region_inside_hole(&outer, &hole, sample, 1e-7));
+        assert!(region_inside_hole(&island, &hole, sample, 1e-7));
+    }
 
     fn dummy_pcurve() -> brepkit_math::curves2d::Curve2D {
         brepkit_math::curves2d::Curve2D::Line(

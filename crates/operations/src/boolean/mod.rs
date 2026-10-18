@@ -103,11 +103,7 @@ pub fn boolean(
     a: SolidId,
     b: SolidId,
 ) -> Result<SolidId, crate::OperationsError> {
-    let result = boolean_inner(topo, op, a, b);
-    if LAST_USED_MESH_FALLBACK.with(std::cell::Cell::take) {
-        MESH_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    result
+    boolean_with_options(topo, op, a, b, BooleanOptions::default())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -939,15 +935,32 @@ pub fn boolean_with_options(
     b: SolidId,
     opts: BooleanOptions,
 ) -> Result<SolidId, crate::OperationsError> {
-    let result = boolean(topo, op, a, b)?;
-    if opts.unify_faces {
-        let unify_opts = brepkit_heal::upgrade::unify_same_domain::UnifyOptions::default();
-        if let Err(e) =
-            brepkit_heal::upgrade::unify_same_domain::unify_same_domain(topo, result, &unify_opts)
-        {
-            log::debug!("boolean unify_faces post-processing failed: {e}");
-        }
+    let result = boolean_inner(topo, op, a, b);
+    if LAST_USED_MESH_FALLBACK.with(std::cell::Cell::take) {
+        MESH_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    let mut result = result?;
+    if opts.unify_faces {
+        result = refine_result(topo, result)?;
+    }
+    Ok(result)
+}
+
+/// Refinement owns its shell list. Boolean shortcuts may share an operand's
+/// shell, and historical features must retain their original faces and wires.
+fn refine_result(topo: &mut Topology, result: SolidId) -> Result<SolidId, crate::OperationsError> {
+    let mut solid = topo.solid(result)?.clone();
+    let shell = topo.shell(solid.outer_shell())?.clone();
+    solid.set_outer_shell(topo.add_shell(shell));
+    let result = topo.add_solid(solid);
+    brepkit_heal::upgrade::unify_same_domain::unify_same_domain(
+        topo,
+        result,
+        &brepkit_heal::upgrade::unify_same_domain::UnifyOptions::default(),
+    )
+    .map_err(|error| crate::OperationsError::InvalidInput {
+        reason: format!("same-domain refinement failed: {error}"),
+    })?;
     Ok(result)
 }
 
@@ -987,6 +1000,9 @@ pub fn compound_cut(
     // batching is comfortably faster for an identical result. Replay it with
     // the captured operands under `kumiko-goma` in the parity-capture cache.
     // Any failure falls back to the sequential loop.
+    if tools.is_empty() {
+        return Ok(target);
+    }
     let mut result = target;
     let mut batched = false;
     let mut batch_tool = None;
@@ -1107,12 +1123,7 @@ pub fn compound_cut(
         }
     }
     if opts.unify_faces {
-        let unify_opts = brepkit_heal::upgrade::unify_same_domain::UnifyOptions::default();
-        if let Err(e) =
-            brepkit_heal::upgrade::unify_same_domain::unify_same_domain(topo, result, &unify_opts)
-        {
-            log::debug!("compound_cut unify_faces failed: {e}");
-        }
+        result = refine_result(topo, result)?;
     }
     Ok(result)
 }

@@ -5270,7 +5270,7 @@ fn half_pin_standing_on_a_knuckle_end_touches_and_fuses_exactly() {
 
     let pin = half_pin(&mut topo);
     let fused = boolean(&mut topo, BooleanOp::Fuse, knuckle, pin).unwrap();
-    assert_watertight_with_volume(&topo, fused, 3, knuckle_volume + half_volume);
+    assert_watertight_with_volume(&topo, fused, 2, knuckle_volume + half_volume);
 }
 
 /// Two keyhole pins that meet end to end on a bracket's knuckle face: a
@@ -5467,7 +5467,7 @@ fn intersect_a_pin_with_a_wide_diagonal_keep_box_keeps_half_the_pin() {
     // the fuse keeps the other half, which the seam does not cross.
     let half = boolean(&mut topo, BooleanOp::Intersect, pin, keep).unwrap();
     let half_volume = std::f64::consts::PI * 0.9 * 0.9 * 4.0 / 2.0;
-    assert_watertight_with_volume(&topo, half, 2, half_volume);
+    assert_watertight_with_volume(&topo, half, 1, half_volume);
     let fused = boolean(&mut topo, BooleanOp::Fuse, pin, keep).unwrap();
     let box_volume = 4.0 * 4.0 * 6.0;
     assert_watertight_with_volume(&topo, fused, 1, box_volume + half_volume);
@@ -7121,7 +7121,19 @@ fn compound_cut_unify_still_merges_normally() {
     let build = |topo: &mut Topology| {
         let a = crate::primitives::make_box(topo, 20.0, 8.0, 8.0).unwrap();
         let b = crate::primitives::make_box(topo, 8.0, 20.0, 8.0).unwrap();
-        let l = boolean(topo, BooleanOp::Fuse, a, b).unwrap();
+        // Keep intentional source fragments: public boolean() now refines by
+        // default, so it would erase the precondition this test measures.
+        let l = boolean_with_options(
+            topo,
+            BooleanOp::Fuse,
+            a,
+            b,
+            BooleanOptions {
+                unify_faces: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut tools = Vec::new();
         for (x, y) in [(14.0_f64, 2.0_f64), (2.0, 14.0)] {
             let t = crate::primitives::make_box(topo, 4.0, 4.0, 10.0).unwrap();
@@ -7148,10 +7160,12 @@ fn compound_cut_unify_still_merges_normally() {
         .len();
 
     let (solid_b, tools_b) = build(&mut topo);
-    let raw = compound_cut(
+    let raw_tool = crate::compound_ops::merge_disjoint_solids(&mut topo, &tools_b).unwrap();
+    let raw = boolean_with_options(
         &mut topo,
+        BooleanOp::Cut,
         solid_b,
-        &tools_b,
+        raw_tool,
         BooleanOptions {
             unify_faces: false,
             ..BooleanOptions::default()
@@ -7236,8 +7250,8 @@ fn fuse_corner_poking_cylinder_stays_analytic() {
         .filter(|&&f| topo.face(f).unwrap().surface().type_tag() == "cylinder")
         .count();
     assert!(
-        curved >= 2,
-        "the pad wall must stay a cylinder, got {curved} curved of {} faces",
+        curved == 1,
+        "the joined pad wall must stay one cylinder, got {curved} curved of {} faces",
         faces.len()
     );
     let vol = solid_volume(&topo, fused, 0.05).unwrap();
@@ -8632,4 +8646,49 @@ fn cut_a_plug_touching_a_cavity_with_split_corners_leaves_the_box() {
         (vol - expected).abs() / expected < 1e-4,
         "box volume {vol:.3} != expected {expected:.3}"
     );
+}
+
+#[test]
+fn refinement_does_not_change_a_shared_operand_shell() {
+    let mut topo = Topology::new();
+    let input = make_unit_cube_manifold_at(&mut topo, 0.0, 0.0, 0.0);
+    let shell_id = topo.solid(input).unwrap().outer_shell();
+    let before = format!("{:?}", topo.shell(shell_id).unwrap());
+    let result = refine_result(&mut topo, input).unwrap();
+    assert_ne!(result, input);
+    assert_ne!(topo.solid(result).unwrap().outer_shell(), shell_id);
+    assert_eq!(format!("{:?}", topo.shell(shell_id).unwrap()), before);
+    assert_volume_near(&topo, input, 1.0, 1e-8);
+    assert_volume_near(&topo, result, 1.0, 1e-8);
+}
+
+#[test]
+fn boolean_refinement_preserves_the_operands_topology() {
+    let mut topo = Topology::new();
+    let blank = crate::primitives::make_box(&mut topo, 10., 10., 4.).unwrap();
+    let tool = crate::primitives::make_cylinder(&mut topo, 2., 6.).unwrap();
+    crate::transform::transform_solid(
+        &mut topo,
+        tool,
+        &brepkit_math::mat::Mat4::translation(5., 5., -1.),
+    )
+    .unwrap();
+    let snapshot = |topo: &Topology| {
+        macro_rules! values {
+            ($($arena:ident),*) => { vec![$(topo.$arena().iter()
+                .map(|(_, value)| format!("{value:?}")).collect::<Vec<_>>()),*] };
+        }
+        values!(vertices, edges, wires, faces, shells, solids)
+    };
+    let before = snapshot(&topo);
+    let result = boolean(&mut topo, BooleanOp::Cut, blank, tool).unwrap();
+    for (before, after) in before.iter().zip(snapshot(&topo)) {
+        assert_eq!(
+            before,
+            &after[..before.len()],
+            "Existing operand entities must remain immutable"
+        );
+    }
+    check_result(&topo, result);
+    assert_volume_near(&topo, result, 400. - 16. * std::f64::consts::PI, 1e-8);
 }
