@@ -10,6 +10,7 @@ pub(crate) mod analytic;
 pub(crate) mod blend_func;
 pub mod boundary_registry;
 pub(crate) mod builder_utils;
+mod canonical;
 pub mod chamfer_builder;
 pub(crate) mod corner;
 pub mod fillet_builder;

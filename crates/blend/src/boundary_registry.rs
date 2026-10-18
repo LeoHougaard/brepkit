@@ -677,6 +677,46 @@ impl BoundaryRegistry {
         Ok(())
     }
 
+    /// Keep exact line and circular contacts analytic in the final registry.
+    /// The old rational parameters are invalid after conversion to radians;
+    /// missing pcurves deliberately request exact analytic projection.
+    pub(crate) fn canonicalize_analytic_boundaries(
+        &mut self,
+        topo: &mut Topology,
+    ) -> Result<(), crate::BlendError> {
+        for entry in &mut self.entries {
+            if entry.retired {
+                continue;
+            }
+            let Some(edge) = entry.edge else {
+                continue;
+            };
+            let EdgeCurve::NurbsCurve(curve) = topo.edge(edge)?.curve() else {
+                continue;
+            };
+            let data = topo.edge(edge)?;
+            let start = topo.vertex(data.start())?.point();
+            let end = topo.vertex(data.end())?.point();
+            let curve = if crate::canonical::rational_line(curve)
+                && (curve.control_points()[0] - start).length() < 1e-10
+                && (curve.control_points()[1] - end).length() < 1e-10
+            {
+                EdgeCurve::Line
+            } else if let Some(circle) = crate::canonical::rational_circle(curve) {
+                EdgeCurve::Circle(circle)
+            } else {
+                continue;
+            };
+            entry.parameter_range = curve.domain_with_endpoints(start, end);
+            entry.curve = curve.clone();
+            entry.pcurves = [None, None];
+            topo.edge_mut(edge)?.set_curve(curve);
+            topo.pcurves_mut()
+                .remove_edges(&std::collections::HashSet::from([edge]));
+        }
+        Ok(())
+    }
+
     /// Look up the registry entry owning a materialized edge.
     #[must_use]
     pub fn handle_for_edge(&self, edge: EdgeId) -> Option<BoundaryHandle> {

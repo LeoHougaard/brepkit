@@ -1456,9 +1456,11 @@ impl<'a> FilletBuilder<'a> {
         // Registry-backed boundaries are the sole closure mechanism for the
         // authoritative fillet path. Positional welding and residual-loop
         // filling are intentionally not available here.
+        boundary_registry.canonicalize_analytic_boundaries(topo)?;
         brepkit_topology::orientation::propagate_orientation(topo, &result_faces, &seeds)?;
         brepkit_topology::orientation::normalize_face_normals(topo, &new_faces, &seeds)?;
         brepkit_topology::orientation::propagate_orientation(topo, &result_faces, &seeds)?;
+        crate::canonical::orient_toroidal_blends(topo, &result_faces, &blend_face_ids)?;
         boundary_registry.refresh_owner_orientations(topo)?;
         // The post-assembly shell may come out globally inverted (every
         // face's effective normal pointing inward) while still passing the

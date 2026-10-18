@@ -43,6 +43,7 @@ use brepkit_math::surfaces::CylindricalSurface;
 use brepkit_math::traits::ParametricSurface;
 use brepkit_math::vec::{Point3, Vec3};
 use brepkit_topology::Topology;
+use brepkit_topology::edge::EdgeCurve;
 use brepkit_topology::face::{FaceId, FaceSurface};
 
 use crate::BlendError;
@@ -426,6 +427,87 @@ fn midpoint_3d(a: Point3, b: Point3) -> Point3 {
     )
 }
 
+/// Material is inside the outer loop and outside each inner loop, regardless
+/// of parameterization or shell orientation. The exact signed boundary
+/// integral identifies which side of the selected coedge that domain occupies.
+fn planar_boundary_material_direction(
+    topo: &Topology,
+    face: FaceId,
+    spine: &Spine,
+) -> Result<Option<(Point3, Vec3)>, BlendError> {
+    let Some(&edge_id) = spine.edges().first() else {
+        return Ok(None);
+    };
+    let data = topo.face(face)?;
+    let FaceSurface::Plane { normal, .. } = data.surface() else {
+        return Ok(None);
+    };
+    let edge = topo.edge(edge_id)?;
+    let a = topo.vertex(edge.start())?.point();
+    let b = topo.vertex(edge.end())?.point();
+    let (lo, hi) = edge.curve().domain_with_endpoints(a, b);
+    let tangent = edge
+        .curve()
+        .tangent_with_endpoints(f64::midpoint(lo, hi), a, b);
+    let mut direction = None;
+    for wire in std::iter::once(data.outer_wire()).chain(data.inner_wires().iter().copied()) {
+        let mut twice_area = 0.0_f64;
+        for oe in topo.wire(wire)?.edges() {
+            let boundary = topo.edge(oe.edge())?;
+            let start = topo.vertex(boundary.start())?.point();
+            let end = topo.vertex(boundary.end())?.point();
+            // A local origin avoids cancellation under large translations.
+            let integral = match boundary.curve() {
+                EdgeCurve::Line => (start - a).cross(end - a).dot(*normal),
+                EdgeCurve::Circle(circle) => {
+                    let (lo, hi) = boundary.curve().domain_with_endpoints(start, end);
+                    (circle.center() - a).cross(end - start).dot(*normal)
+                        + circle.normal().dot(*normal) * circle.radius().powi(2) * (hi - lo)
+                }
+                _ => return Ok(None),
+            };
+            twice_area += integral * if oe.is_forward() { 1.0 } else { -1.0 };
+        }
+        if twice_area.abs() <= ANALYTIC_TOL_LIN.powi(2) {
+            return Ok(None);
+        }
+        let interior = twice_area.signum() * if wire == data.outer_wire() { 1.0 } else { -1.0 };
+        for coedge in topo
+            .wire(wire)?
+            .edges()
+            .iter()
+            .filter(|oe| oe.edge() == edge_id)
+        {
+            if direction.is_some() {
+                return Ok(None);
+            }
+            let sense = if coedge.is_forward() { 1.0 } else { -1.0 };
+            direction = normal.cross(tangent).normalize().ok().map(|v| {
+                (
+                    edge.curve()
+                        .evaluate_with_endpoints(f64::midpoint(lo, hi), a, b),
+                    v * (sense * interior),
+                )
+            });
+        }
+    }
+    Ok(direction)
+}
+
+/// Local material side of a planar support relative to its other support.
+fn material_side_witness(
+    topo: &Topology,
+    face: FaceId,
+    n_other: Vec3,
+    spine: &Spine,
+) -> Result<f64, BlendError> {
+    planar_boundary_material_direction(topo, face, spine)?
+        .map(|(_, direction)| direction.dot(n_other))
+        .ok_or_else(|| BlendError::PlanningFailure {
+            reason: "selected edge has no unambiguous planar material side".to_owned(),
+        })
+}
+
 /// Fillet between two planes: the result is a cylindrical surface.
 ///
 /// # Geometry
@@ -439,34 +521,6 @@ fn midpoint_3d(a: Point3, b: Point3) -> Point3 {
 /// # Errors
 /// Returns `BlendError` if topology lookups or math operations fail.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-/// Signed extent of `face`'s vertices against another plane's inward normal
-/// `n_other`, measured from the spine point `p`. The extreme-magnitude vertex
-/// is the witness: positive means the face reaches into the material side of
-/// the other plane (convex edge), negative means the void side (concave).
-fn material_side_witness(
-    topo: &Topology,
-    face: FaceId,
-    n_other: Vec3,
-    p: Point3,
-) -> Result<f64, BlendError> {
-    let f = topo.face(face)?;
-    let mut wires = vec![f.outer_wire()];
-    wires.extend(f.inner_wires().iter().copied());
-    let mut extreme = 0.0_f64;
-    for wid in wires {
-        for oe in topo.wire(wid)?.edges() {
-            let e = topo.edge(oe.edge())?;
-            for vid in [e.start(), e.end()] {
-                let s = n_other.dot(topo.vertex(vid)?.point() - p);
-                if s.abs() > extreme.abs() {
-                    extreme = s;
-                }
-            }
-        }
-    }
-    Ok(extreme)
-}
-
 fn plane_plane_fillet(
     spine: &Spine,
     topo: &Topology,
@@ -491,15 +545,11 @@ fn plane_plane_fillet(
 
     let (bisector, _cross_dir) = section_basis(n1, n2, tangent);
 
-    // The inward normals alone cannot distinguish a convex edge from a
-    // concave (notch) one — both wedges share the same bounding planes.
-    // The tie-breaker is the faces' extent: a convex neighbour face lies on
-    // the material (inward) side of the other plane, a concave one on the
-    // void side. On a concave edge the fillet centre and contacts sit up the
-    // OUTWARD bisector, and the in-plane contact projections then follow the
-    // real walls instead of their extensions.
-    let w1 = material_side_witness(topo, face1, n2, p_start)?;
-    let w2 = material_side_witness(topo, face2, n1, p_start)?;
+    // The inward normals alone do not identify which bounded half-planes
+    // meet at the edge. The oriented coedges supply that local material side;
+    // distant vertices on a non-convex support cannot choose another branch.
+    let w1 = material_side_witness(topo, face1, n2, spine)?;
+    let w2 = material_side_witness(topo, face2, n1, spine)?;
     let bisector = if w1 < -ANALYTIC_TOL_LIN && w2 < -ANALYTIC_TOL_LIN {
         -bisector
     } else {
@@ -710,13 +760,13 @@ fn plane_plane_chamfer(
 /// plane normal.
 ///
 /// Returns `Some(StripeResult)` with an exact toroidal blend surface for a
-/// convex post on a plate, a concave hole through a plate, and a bounded-disc
-/// rim. A post and a hole both contact a larger plane outside the spine, so
-/// their torus major radius is `r_c + r`. A bounded disc is the only inward
-/// case, with `major = r_c - r`.
+/// post on a plate, a hole through a plate, or an outer rim. The selected
+/// planar coedge identifies the local material side, including partial arcs
+/// on larger caps: inward material gives `major = r_c - r`, outward material
+/// gives `major = r_c + r`.
 ///
-/// The axial placement follows the material side. A hole and a bounded rim
-/// move one radius along `n_p_inward`; a post moves along `-n_p_inward`.
+/// The axial placement follows both supports' material sides. A convex mouth
+/// moves one radius along `n_p_inward`; a concave shoulder moves opposite it.
 /// This keeps the plane contact inside the support face instead of placing a
 /// hole fillet's contact circle in the void.
 ///
@@ -753,31 +803,32 @@ pub fn plane_cylinder_fillet(
         return Ok(None);
     }
 
-    // 2) Detect concave ("hole through plate") vs convex ("post on plate").
-    //    The cylinder face's `reversed` flag tells us which side of the
-    //    cylinder lateral the surrounding material lives on:
-    //      * not reversed: material is on the cylinder's *inward* side
-    //        (a solid post). Convex external corner.
-    //      * reversed:     material is on the cylinder's *outward* side
-    //        (a hole through a slab). Concave internal corner.
-    let concave = topo.face(face_cyl)?.is_reversed();
+    // The cylinder's face sense identifies its material side radially.
+    // The cap's local coedge, rather than distant cap vertices, identifies
+    // whether its material extends radially inward or outward. Their agreement
+    // distinguishes a convex mouth from a concave shoulder for complete circles
+    // and bounded arcs alike, independently of cap extent or world frame.
+    let Some((point, cap_material)) = planar_boundary_material_direction(topo, face_plane, spine)?
+    else {
+        return Ok(None);
+    };
+    let delta = point - cyl.origin();
+    let radial = (delta - axis_c * delta.dot(axis_c)).normalize()?;
+    let cap_side = cap_material.dot(radial);
+    if cap_side.abs() < 1.0 - tol_ang {
+        return Ok(None);
+    }
+    let cap_side = cap_side.signum();
+    let wall_side = if topo.face(face_cyl)?.is_reversed() {
+        1.0
+    } else {
+        -1.0
+    };
+    let convex = cap_side * wall_side > 0.0;
     let r_c = cyl.radius();
-
-    // 2b) Among the convex (non-reversed-cylinder) configurations, distinguish
-    //     the "post on a large plate" (the plate extends past the cylinder, so
-    //     the fillet flares OUTWARD with plate contact at `r_c + r`) from the
-    //     "rim of a bare disc cap bounded BY the cylinder" (e.g. a primitive
-    //     cylinder's bottom/top rim — the cap *is* the circle of radius `r_c`,
-    //     so the fillet rounds INWARD with plate contact at `r_c - r`). The
-    //     discriminator: every boundary vertex of a bounded cap, its holes'
-    //     included, lies within `r_c` of the cylinder axis; a plate that the
-    //     post stands on has boundary vertices beyond `r_c`.
-    let rim = !concave && plane_is_bounded_disc(topo, face_plane, cyl, r_c)?;
-
-    // 3) Only a bounded disc rim contracts toward the axis, to a spindle
-    // torus once `r >= r_c / 2`. Post and hole contacts expand away from the
-    // axis. Every case keeps `r < r_c`.
-    let inward = rim;
+    let inward = cap_side < 0.0;
+    // Inward contacts contract toward the axis and can use a spindle torus
+    // beyond r_c/2. All analytic branches currently require r < r_c.
     let max_radius = r_c;
     if radius <= tol_lin || radius >= max_radius {
         return Ok(None);
@@ -789,16 +840,9 @@ pub fn plane_cylinder_fillet(
     let step = d_plane - n_p_inward.dot(Vec3::new(o_c.x(), o_c.y(), o_c.z()));
     let p_axis_on_plane = o_c + n_p_inward * step;
 
-    // 5) Torus placement. A reversed cylinder is a hole wall: its plane
-    // contact must move outward into the planar support (`r_c + r`) and its
-    // axial contact must move into material along `n_p_inward`. A bounded disc
-    // also moves axially inward but contracts radially. A post on a larger
-    // plate keeps the historic opposite axial direction and expands radially.
-    let z_axis_dir = if concave || rim {
-        n_p_inward
-    } else {
-        -n_p_inward
-    };
+    // The ball lies on the material side at a convex edge and on the void
+    // side at a concave one. Radial and axial signs follow the two supports.
+    let z_axis_dir = n_p_inward * if convex { 1.0 } else { -1.0 };
     let torus_center = p_axis_on_plane + z_axis_dir * radius;
     let major_radius = if inward { r_c - radius } else { r_c + radius };
     let minor_radius = radius;
@@ -832,21 +876,23 @@ pub fn plane_cylinder_fillet(
     )?;
 
     // 8) Spine endpoints in 3D and corresponding cylinder u-parameters.
-    //    For a closed spine (full revolution) we span [u_start, u_start + 2π]
-    //    regardless of where the projection lands. Otherwise we disambiguate
-    //    the seam so u_end > u_start when the spine sweeps CCW.
+    //    The spine's exact tangent determines the angular traversal sense.
+    //    Circle and cylinder frames may have opposite axes; always increasing
+    //    cylinder u would then choose the complementary partial arc.
     let p_spine_start = spine.evaluate(topo, 0.0)?;
     let u_start = ParametricSurface::project_point(cyl, p_spine_start).0;
+    let angular_sense = axis_c
+        .cross(p_spine_start - cyl.origin())
+        .dot(spine.tangent(topo, 0.0)?)
+        .signum();
     let u_end = if is_closed_spine {
-        u_start + 2.0 * std::f64::consts::PI
+        u_start + angular_sense * std::f64::consts::TAU
     } else {
         let p_spine_end = spine.evaluate(topo, spine_len)?;
         let u_end_raw = ParametricSurface::project_point(cyl, p_spine_end).0;
-        if u_end_raw > u_start {
-            u_end_raw
-        } else {
-            u_end_raw + 2.0 * std::f64::consts::PI
-        }
+        u_start
+            + angular_sense
+                * (angular_sense * (u_end_raw - u_start)).rem_euclid(std::f64::consts::TAU)
     };
 
     // 9) 3D contact curves.
@@ -947,43 +993,6 @@ pub fn plane_cylinder_fillet(
         stripe,
         new_edges: Vec::new(),
     }))
-}
-
-/// Is the plane face a bounded disc cap whose rim is the cylinder (radius
-/// `r_c`), as opposed to a larger plate the cylinder stands on?
-///
-/// True when every boundary vertex, holes included, lies within `r_c` (plus a
-/// small tolerance) of the cylinder axis. For a primitive cylinder's end cap
-/// the only boundary is the rim circle of radius `r_c`, and a tube's mouth
-/// adds its bore inside it; for a plate that a post stands on, the plate
-/// corners lie beyond `r_c`.
-fn plane_is_bounded_disc(
-    topo: &Topology,
-    face_plane: FaceId,
-    cyl: &brepkit_math::surfaces::CylindricalSurface,
-    r_c: f64,
-) -> Result<bool, BlendError> {
-    let face = topo.face(face_plane)?;
-    let axis = cyl.axis();
-    let o_c = cyl.origin();
-    // Radial distance from the cylinder axis to a point: |(p − o_c) − ((p − o_c)·axis)·axis|.
-    let radial = |p: Point3| -> f64 {
-        let d = p - o_c;
-        let along = axis * axis.dot(d);
-        (d - along).length()
-    };
-    let tol = r_c * 1e-6 + ANALYTIC_TOL_LIN;
-    for wire_id in std::iter::once(face.outer_wire()).chain(face.inner_wires().iter().copied()) {
-        for oe in topo.wire(wire_id)?.edges() {
-            let edge = topo.edge(oe.edge())?;
-            let s = topo.vertex(edge.start())?.point();
-            let e = topo.vertex(edge.end())?.point();
-            if radial(s) > r_c + tol || radial(e) > r_c + tol {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
 }
 
 /// Recover the cylinder's axial v-parameter for a 3D point known to lie on

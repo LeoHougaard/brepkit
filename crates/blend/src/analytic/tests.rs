@@ -6,15 +6,29 @@ use brepkit_topology::face::Face;
 use brepkit_topology::vertex::Vertex;
 use brepkit_topology::wire::{OrientedEdge, Wire};
 
-/// Create a spine along a single edge from `a` to `b`, plus two dummy faces.
+/// Create a spine shared by two bounded planar supports.
 fn make_spine(topo: &mut Topology, a: Point3, b: Point3) -> (Spine, FaceId, FaceId) {
     let v0 = topo.add_vertex(Vertex::new(a, 1e-7));
     let v1 = topo.add_vertex(Vertex::new(b, 1e-7));
     let eid = topo.add_edge(Edge::new(v0, v1, EdgeCurve::Line));
 
-    let oe = OrientedEdge::new(eid, true);
-    let w1 = topo.add_wire(Wire::new(vec![oe], false).unwrap());
-    let w2 = topo.add_wire(Wire::new(vec![OrientedEdge::new(eid, true)], false).unwrap());
+    let mut make_support = |forward: bool, offset: Vec3| {
+        let (start, end) = if forward { (v0, v1) } else { (v1, v0) };
+        let end_point = topo.vertex(end).unwrap().point();
+        let start_point = topo.vertex(start).unwrap().point();
+        let far_end = topo.add_vertex(Vertex::new(end_point + offset, 1e-7));
+        let far_start = topo.add_vertex(Vertex::new(start_point + offset, 1e-7));
+        let mut edges = vec![OrientedEdge::new(eid, forward)];
+        for (a, b) in [(end, far_end), (far_end, far_start), (far_start, start)] {
+            edges.push(OrientedEdge::new(
+                topo.add_edge(Edge::new(a, b, EdgeCurve::Line)),
+                true,
+            ));
+        }
+        topo.add_wire(Wire::new(edges, true).unwrap())
+    };
+    let w1 = make_support(true, Vec3::new(0.0, 10.0, 0.0));
+    let w2 = make_support(false, Vec3::new(0.0, 0.0, 10.0));
     let f1 = topo.add_face(Face::new(
         w1,
         vec![],
@@ -254,10 +268,21 @@ fn plane_cylinder_fillet_hole_contacts_support_outside_spine() {
     let spine = Spine::from_single_edge(&topo, eid).unwrap();
 
     // Plate face — non-reversed, normal = +z (top of plate).
-    let w1 = topo.add_wire(Wire::new(vec![OrientedEdge::new(eid, true)], true).unwrap());
+    let w1 = topo.add_wire(Wire::new(vec![OrientedEdge::new(eid, false)], true).unwrap());
+    let outer = brepkit_topology::builder::make_polygon_wire(
+        &mut topo,
+        &[
+            Point3::new(-10.0, -10.0, 0.0),
+            Point3::new(10.0, -10.0, 0.0),
+            Point3::new(10.0, 10.0, 0.0),
+            Point3::new(-10.0, 10.0, 0.0),
+        ],
+        1e-7,
+    )
+    .unwrap();
     let face_plate = topo.add_face(Face::new(
-        w1,
-        vec![],
+        outer,
+        vec![w1],
         FaceSurface::Plane {
             normal: Vec3::new(0.0, 0.0, 1.0),
             d: 0.0,
@@ -326,8 +351,7 @@ fn plane_cylinder_fillet_hole_contacts_support_outside_spine() {
     );
 }
 
-/// A bare disc cap whose only boundary is the cylinder rim (no inner wires,
-/// all boundary vertices within `r_c` of the axis) is an INWARD rim — the
+/// A bare disc cap has material inside its outer circular boundary — the
 /// fillet rounds the disc inward, with `major = r_c − r` and the torus centre
 /// one radius into the material (z = +r). This is the gh #967 geometry, and
 /// the direct analogue of the integration-level
@@ -431,12 +455,28 @@ fn plane_cylinder_fillet_takes_spindle_tori_up_to_the_cylinder_radius() {
             Circle3D::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), r_c).unwrap();
         let eid = topo.add_edge(Edge::new(v, v, EdgeCurve::Circle(circle)));
         let spine = Spine::from_single_edge(topo, eid).unwrap();
-        let w1 = topo.add_wire(Wire::new(vec![OrientedEdge::new(eid, true)], true).unwrap());
+        let w1 = topo.add_wire(Wire::new(vec![OrientedEdge::new(eid, !reversed)], true).unwrap());
+        let (outer, holes) = if reversed {
+            let outer = brepkit_topology::builder::make_polygon_wire(
+                topo,
+                &[
+                    Point3::new(-10.0, -10.0, 0.0),
+                    Point3::new(10.0, -10.0, 0.0),
+                    Point3::new(10.0, 10.0, 0.0),
+                    Point3::new(-10.0, 10.0, 0.0),
+                ],
+                1e-7,
+            )
+            .unwrap();
+            (outer, vec![w1])
+        } else {
+            (w1, vec![])
+        };
         let face_plate = topo.add_face(Face::new(
-            w1,
-            vec![],
+            outer,
+            holes,
             FaceSurface::Plane {
-                normal: Vec3::new(0.0, 0.0, -1.0),
+                normal: Vec3::new(0.0, 0.0, if reversed { 1.0 } else { -1.0 }),
                 d: 0.0,
             },
         ));
@@ -5544,4 +5584,206 @@ fn plane_cone_chamfer_concave_emits_chamfer_cone() {
         (on_surf_cone - want_cone).length() < 1e-9,
         "cone-side contact must lie on chamfer cone: project→eval gave {on_surf_cone:?}, want {want_cone:?}"
     );
+}
+
+/// Changing distant cap vertices or the world frame cannot change the local
+/// rolling-ball branch. The coedge domain and wall orientation determine it.
+#[test]
+fn plane_cylinder_material_side_is_local_for_full_and_partial_rims() {
+    use brepkit_math::curves::Circle3D;
+    for axis in [
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+    ] {
+        let center = Point3::new(100.0, -70.0, 30.0);
+        let u = if axis.x().abs() < 0.8 {
+            Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3::new(0.0, 1.0, 0.0)
+        };
+        let v = axis.cross(u);
+        let at = |x: f64, y: f64| center + u * x + v * y;
+        for closed in [false, true] {
+            for inward in [false, true] {
+                for reversed in [false, true] {
+                    let mut topo = Topology::new();
+                    let circle = Circle3D::new_with_ref(center, axis, 10.0, u).unwrap();
+                    let a = topo.add_vertex(Vertex::new(at(10.0, 0.0), 1e-7));
+                    let b = if closed {
+                        a
+                    } else {
+                        topo.add_vertex(Vertex::new(at(0.0, 10.0), 1e-7))
+                    };
+                    let edge = topo.add_edge(Edge::new(a, b, EdgeCurve::Circle(circle)));
+                    let mut boundary = vec![OrientedEdge::new(edge, true)];
+                    if !closed {
+                        let mut from = b;
+                        for point in [at(-50.0, 10.0), at(-50.0, -50.0), at(10.0, -50.0)] {
+                            let to = topo.add_vertex(Vertex::new(point, 1e-7));
+                            boundary.push(OrientedEdge::new(
+                                topo.add_edge(Edge::new(from, to, EdgeCurve::Line)),
+                                true,
+                            ));
+                            from = to;
+                        }
+                        boundary.push(OrientedEdge::new(
+                            topo.add_edge(Edge::new(from, a, EdgeCurve::Line)),
+                            true,
+                        ));
+                    }
+                    if !inward {
+                        boundary = boundary
+                            .iter()
+                            .rev()
+                            .map(|oe| OrientedEdge::new(oe.edge(), !oe.is_forward()))
+                            .collect();
+                    }
+                    let wire = topo.add_wire(Wire::new(boundary, true).unwrap());
+                    let (outer, holes) = if inward {
+                        (wire, vec![])
+                    } else {
+                        let outer = brepkit_topology::builder::make_polygon_wire(
+                            &mut topo,
+                            &[
+                                at(-100.0, -100.0),
+                                at(100.0, -100.0),
+                                at(100.0, 100.0),
+                                at(-100.0, 100.0),
+                            ],
+                            1e-7,
+                        )
+                        .unwrap();
+                        (outer, vec![wire])
+                    };
+                    let d = axis.dot(center - Point3::new(0.0, 0.0, 0.0));
+                    let plane = topo.add_face(Face::new(
+                        outer,
+                        holes,
+                        FaceSurface::Plane { normal: axis, d },
+                    ));
+                    let wall_wire = topo
+                        .add_wire(Wire::new(vec![OrientedEdge::new(edge, false)], false).unwrap());
+                    let cylinder = CylindricalSurface::new(center, axis, 10.0).unwrap();
+                    let mut wall =
+                        Face::new(wall_wire, vec![], FaceSurface::Cylinder(cylinder.clone()));
+                    wall.set_reversed(reversed);
+                    let wall = topo.add_face(wall);
+                    let spine = Spine::from_single_edge(&topo, edge).unwrap();
+                    let result = plane_cylinder_fillet(
+                        -axis, -d, &cylinder, &spine, &topo, 2.0, plane, wall,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let FaceSurface::Torus(torus) = &result.stripe.surface else {
+                        panic!("expected torus");
+                    };
+                    assert!((torus.major_radius() - if inward { 8.0 } else { 12.0 }).abs() < 1e-9);
+                    let convex = inward != reversed;
+                    let expected = center + axis * if convex { -2.0 } else { 2.0 };
+                    assert!(
+                        (torus.center() - expected).length() < 1e-9,
+                        "closed={closed},inward={inward},reversed={reversed}"
+                    );
+                    let (_, material) = planar_boundary_material_direction(&topo, plane, &spine)
+                        .unwrap()
+                        .unwrap();
+                    let face = topo.face(plane).unwrap();
+                    let wires: Vec<_> = std::iter::once(face.outer_wire())
+                        .chain(face.inner_wires().iter().copied())
+                        .collect();
+                    for wire in wires {
+                        let boundary = topo
+                            .wire(wire)
+                            .unwrap()
+                            .edges()
+                            .iter()
+                            .rev()
+                            .map(|oe| OrientedEdge::new(oe.edge(), !oe.is_forward()))
+                            .collect();
+                        *topo.wire_mut(wire).unwrap() = Wire::new(boundary, true).unwrap();
+                    }
+                    topo.face_mut(plane).unwrap().set_reversed(true);
+                    let (_, equivalent) = planar_boundary_material_direction(&topo, plane, &spine)
+                        .unwrap()
+                        .unwrap();
+                    assert!((material - equivalent).length() < 1e-10);
+                    // Reversing the exact edge representation and its coedge
+                    // keeps the same material domain, including partial arcs.
+                    let data = topo.edge_mut(edge).unwrap();
+                    data.set_start(b);
+                    data.set_end(a);
+                    data.set_curve(EdgeCurve::Circle(
+                        Circle3D::new_with_ref(center, -axis, 10.0, u).unwrap(),
+                    ));
+                    let face = topo.face(plane).unwrap();
+                    let wires: Vec<_> = std::iter::once(face.outer_wire())
+                        .chain(face.inner_wires().iter().copied())
+                        .collect();
+                    for wire in wires {
+                        let boundary = topo
+                            .wire(wire)
+                            .unwrap()
+                            .edges()
+                            .iter()
+                            .map(|oe| {
+                                OrientedEdge::new(oe.edge(), oe.is_forward() != (oe.edge() == edge))
+                            })
+                            .collect();
+                        *topo.wire_mut(wire).unwrap() = Wire::new(boundary, true).unwrap();
+                    }
+                    let spine = Spine::from_single_edge(&topo, edge).unwrap();
+                    let opposite = plane_cylinder_fillet(
+                        -axis, -d, &cylinder, &spine, &topo, 2.0, plane, wall,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    for t in [0.25, 0.5, 0.75] {
+                        assert!(
+                            (result.stripe.contact1.evaluate(t)
+                                - opposite.stripe.contact1.evaluate(1.0 - t))
+                            .length()
+                                < 1e-8
+                        );
+                        assert!(
+                            (result.stripe.contact2.evaluate(t)
+                                - opposite.stripe.contact2.evaluate(1.0 - t))
+                            .length()
+                                < 1e-8
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_rational_circle_contacts_canonicalize_in_any_frame_and_span() {
+    use brepkit_math::curves::Circle3D;
+    for axis in [
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+    ] {
+        let center = Point3::new(100.0, -70.0, 30.0);
+        let circle = Circle3D::new(center, axis, 10.0).unwrap();
+        for span in [0.3, std::f64::consts::FRAC_PI_2, 3.7, std::f64::consts::TAU] {
+            for sign in [-1.0, 1.0] {
+                let curve = circle_arc_to_nurbs(&circle, 0.2, 0.2 + sign * span).unwrap();
+                let canonical =
+                    crate::canonical::rational_circle(&curve).expect("exact rational circle");
+                assert!((canonical.center() - center).length() < 1e-8);
+                assert!((canonical.radius() - 10.0).abs() < 1e-8);
+                assert!(canonical.normal().dot(axis) * sign > 1.0 - 1e-10);
+                // A plausible-looking free-form perturbation must stay NURBS.
+                let mut points = curve.control_points().to_vec();
+                points[1] = points[1] + axis * 0.001;
+                let changed =
+                    NurbsCurve::new(2, curve.knots().to_vec(), points, curve.weights().to_vec())
+                        .unwrap();
+                assert!(crate::canonical::rational_circle(&changed).is_none());
+            }
+        }
+    }
 }
