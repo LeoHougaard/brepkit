@@ -51,6 +51,8 @@ use crate::section::CircSection;
 use crate::spine::Spine;
 use crate::stripe::{Stripe, StripeResult};
 
+mod support_domain;
+
 /// Linear tolerance for "essentially zero" guards in analytic helpers.
 ///
 /// 1e-9 is tighter than `Tolerance::default().linear` (= 1e-7, the
@@ -573,6 +575,7 @@ fn plane_plane_fillet(
     let c1_end = p_end + contact_dir1 * contact_offset;
     let c2_start = p_start + contact_dir2 * contact_offset;
     let c2_end = p_end + contact_dir2 * contact_offset;
+    support_domain::require_contacts(topo, [(face1, c1_start, c1_end), (face2, c2_start, c2_end)])?;
     let contact1 = nurbs_line(c1_start, c1_end)?;
     let contact2 = nurbs_line(c2_start, c2_end)?;
 
@@ -678,6 +681,7 @@ fn plane_plane_chamfer(
     let c1_end = p_end + contact_dir1 * d1;
     let c2_start = p_start + contact_dir2 * d2;
     let c2_end = p_end + contact_dir2 * d2;
+    support_domain::require_contacts(topo, [(face1, c1_start, c1_end), (face2, c2_start, c2_end)])?;
 
     let contact1 = nurbs_line(c1_start, c1_end)?;
     let contact2 = nurbs_line(c2_start, c2_end)?;

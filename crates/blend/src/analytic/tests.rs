@@ -8,6 +8,15 @@ use brepkit_topology::wire::{OrientedEdge, Wire};
 
 /// Create a spine shared by two bounded planar supports.
 fn make_spine(topo: &mut Topology, a: Point3, b: Point3) -> (Spine, FaceId, FaceId) {
+    make_spine_with_normal(topo, a, b, Vec3::new(0.0, 1.0, 0.0))
+}
+
+fn make_spine_with_normal(
+    topo: &mut Topology,
+    a: Point3,
+    b: Point3,
+    normal2: Vec3,
+) -> (Spine, FaceId, FaceId) {
     let v0 = topo.add_vertex(Vertex::new(a, 1e-7));
     let v1 = topo.add_vertex(Vertex::new(b, 1e-7));
     let eid = topo.add_edge(Edge::new(v0, v1, EdgeCurve::Line));
@@ -28,7 +37,7 @@ fn make_spine(topo: &mut Topology, a: Point3, b: Point3) -> (Spine, FaceId, Face
         topo.add_wire(Wire::new(edges, true).unwrap())
     };
     let w1 = make_support(true, Vec3::new(0.0, 10.0, 0.0));
-    let w2 = make_support(false, Vec3::new(0.0, 0.0, 10.0));
+    let w2 = make_support(false, Vec3::new(1.0, 0.0, 0.0).cross(normal2) * 10.0);
     let f1 = topo.add_face(Face::new(
         w1,
         vec![],
@@ -41,7 +50,7 @@ fn make_spine(topo: &mut Topology, a: Point3, b: Point3) -> (Spine, FaceId, Face
         w2,
         vec![],
         FaceSurface::Plane {
-            normal: Vec3::new(0.0, 1.0, 0.0),
+            normal: normal2,
             d: 0.0,
         },
     ));
@@ -120,10 +129,11 @@ fn plane_plane_60_degree_fillet() {
     let n2 = Vec3::new(0.0, angle.sin(), angle.cos());
     let n2 = n2.normalize().unwrap();
 
-    let (spine, f1, f2) = make_spine(
+    let (spine, f1, f2) = make_spine_with_normal(
         &mut topo,
         Point3::new(0.0, 0.0, 0.0),
         Point3::new(5.0, 0.0, 0.0),
+        n2,
     );
 
     let radius = 1.5;
@@ -153,6 +163,144 @@ fn plane_plane_60_degree_fillet() {
     assert!(
         (actual_offset - expected_offset).abs() < 1e-10,
         "Expected offset {expected_offset}, got {actual_offset}"
+    );
+}
+
+#[test]
+fn planar_blends_require_finite_support_for_their_tangent_contacts() {
+    let mut topo = Topology::new();
+    let (spine, f1, f2) = make_spine(
+        &mut topo,
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(20.0, 0.0, 0.0),
+    );
+    let n1 = Vec3::new(0.0, 0.0, 1.0);
+    let n2 = Vec3::new(0.0, 1.0, 0.0);
+    for radius in [0.1, 2.0, 9.9] {
+        assert!(plane_plane_fillet(&spine, &topo, n1, n2, radius, f1, f2).is_ok());
+        assert!(plane_plane_chamfer(&spine, &topo, n1, n2, radius, radius, f1, f2).is_ok());
+    }
+    for radius in [10.0, 10.1, 100.0] {
+        assert!(
+            plane_plane_fillet(&spine, &topo, n1, n2, radius, f1, f2).is_err(),
+            "radius {radius} exceeds the actual support"
+        );
+        assert!(
+            plane_plane_chamfer(&spine, &topo, n1, n2, radius, 1.0, f1, f2).is_err(),
+            "one infeasible support must reject the blend"
+        );
+    }
+}
+
+fn domain_polygon(topo: &mut Topology, points: &[(f64, f64)]) -> brepkit_topology::wire::WireId {
+    let vertices: Vec<_> = points
+        .iter()
+        .map(|&(x, y)| topo.add_vertex(Vertex::new(Point3::new(x, y, 0.0), 1e-7)))
+        .collect();
+    let edges = vertices
+        .iter()
+        .zip(vertices.iter().cycle().skip(1))
+        .map(|(&a, &b)| OrientedEdge::new(topo.add_edge(Edge::new(a, b, EdgeCurve::Line)), true))
+        .collect();
+    topo.add_wire(Wire::new(edges, true).unwrap())
+}
+
+fn domain_face(
+    topo: &mut Topology,
+    points: &[(f64, f64)],
+    holes: Vec<brepkit_topology::wire::WireId>,
+) -> FaceId {
+    let outer = domain_polygon(topo, points);
+    topo.add_face(Face::new(
+        outer,
+        holes,
+        FaceSurface::Plane {
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            d: 0.0,
+        },
+    ))
+}
+
+#[test]
+fn finite_domain_admission_allows_end_clipping_but_not_concave_or_hole_gaps() {
+    let mut topo = Topology::new();
+    let tapered = domain_face(&mut topo, &[(0.0, 0.0), (10.0, 0.0), (5.0, 10.0)], vec![]);
+    let contact = |face| {
+        [(
+            face,
+            Point3::new(0.0, 2.0, 0.0),
+            Point3::new(10.0, 2.0, 0.0),
+        ); 2]
+    };
+    assert!(
+        support_domain::require_contacts(&topo, contact(tapered)).is_ok(),
+        "Legitimate end clipping must not be mistaken for infeasibility"
+    );
+    let concave = domain_face(
+        &mut topo,
+        &[
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 8.0),
+            (6.0, 8.0),
+            (6.0, 1.0),
+            (4.0, 1.0),
+            (4.0, 8.0),
+            (0.0, 8.0),
+        ],
+        vec![],
+    );
+    assert!(
+        support_domain::require_contacts(&topo, contact(concave)).is_err(),
+        "Both endpoints are inside, but the middle crosses a notch"
+    );
+    let hole = domain_polygon(&mut topo, &[(4.0, 1.0), (4.0, 3.0), (6.0, 3.0), (6.0, 1.0)]);
+    let holed = domain_face(
+        &mut topo,
+        &[(0.0, 0.0), (10.0, 0.0), (10.0, 8.0), (0.0, 8.0)],
+        vec![hole],
+    );
+    assert!(
+        support_domain::require_contacts(&topo, contact(holed)).is_err(),
+        "An inner wire must remove contact material"
+    );
+    let first = domain_face(
+        &mut topo,
+        &[(0.0, 0.0), (3.0, 0.0), (3.0, 8.0), (0.0, 8.0)],
+        vec![],
+    );
+    let second = domain_face(
+        &mut topo,
+        &[(7.0, 0.0), (10.0, 0.0), (10.0, 8.0), (7.0, 8.0)],
+        vec![],
+    );
+    assert!(
+        support_domain::require_contacts(&topo, [contact(first)[0], contact(second)[0]]).is_err(),
+        "Individually valid contacts need a common axial interval"
+    );
+}
+
+#[test]
+fn finite_planar_domains_preserve_distant_circular_holes_and_reject_crossings() {
+    use brepkit_math::curves::Circle3D;
+    let mut topo = Topology::new();
+    let circle = Circle3D::new(Point3::new(5.0, 4.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0).unwrap();
+    let vertex = topo.add_vertex(Vertex::new(circle.evaluate(0.0), 1e-7));
+    let edge = topo.add_edge(Edge::new(vertex, vertex, EdgeCurve::Circle(circle)));
+    let hole = topo.add_wire(Wire::new(vec![OrientedEdge::new(edge, false)], true).unwrap());
+    let face = domain_face(
+        &mut topo,
+        &[(0.0, 0.0), (10.0, 0.0), (10.0, 8.0), (0.0, 8.0)],
+        vec![hole],
+    );
+    let contact = |y| [(face, Point3::new(0.0, y, 0.0), Point3::new(10.0, y, 0.0)); 2];
+    assert!(
+        support_domain::require_contacts(&topo, contact(1.0)).is_ok(),
+        "A distant circular hole cannot disable otherwise supported blends"
+    );
+    assert!(
+        support_domain::require_contacts(&topo, contact(4.0)).is_err(),
+        "The exact circular hole must interrupt the contact"
     );
 }
 
